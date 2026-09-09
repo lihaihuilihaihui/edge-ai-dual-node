@@ -1,0 +1,53 @@
+# 编译产物
+*.o
+*.ko
+*.mod
+*.mod.c
+*.order
+*.symvers
+*.cmd
+*.a
+*.so
+*.elf
+*.bin
+*.img
+build/
+out/
+cmake-build-*/
+
+# 中间/临时
+*.log
+*.tmp
+*~
+*.swp
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# RKNN / 模型（体积大，不入库）
+*.rknn
+*.onnx
+*.pt
+weights/
+datasets/
+
+# ESP-IDF
+stage2-esp32/build/
+managed_components/
+
+# 环境/密钥
+.env
+*.key
+*.pem
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# 系统备份镜像
+*.img.gz
+backup/
