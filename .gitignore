@@ -48,6 +48,14 @@ managed_components/
 .vscode/
 *.code-workspace
 
+# 临时/测试产物
+tmp/
+*.jpg
+*.png
+*.bmp
+!docs/**/*.png
+!docs/**/*.jpg
+
 # 系统备份镜像
 *.img.gz
 backup/
