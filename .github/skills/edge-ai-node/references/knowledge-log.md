@@ -257,6 +257,79 @@
 - **教训**：**不要相信商品页的「免驱」措辞，要看设备描述符。** 罗技等大厂从不为 Linux 做官方背书，但产品通常是标准 UVC，照样能用
 - **关联**：`references/hardware.md` §2.5
 
+### K-022 【实测】主设备号对应驱动，次设备号对应设备实例——两者不可混淆
+- **日期**：2026-09-12
+- **现象**：容易误以为「主设备号对应驱动、次设备号对应第几个驱动」。实际**一个主设备号只对应一个驱动**，次设备号是该驱动管理的**设备实例**编号
+- **根因**：内核的字符设备表 `chrdevs[主设备号]` 里**只存一个 `cdev`**（一个驱动）。驱动注册时拿到主设备号，之后自己决定如何把次设备号分配给旗下多个实例
+- **证据链**：
+  ```
+  $ grep 81 /proc/devices
+   81 video4linux          ← 主设备号 81 只有一个名字
+
+  $ ls -l /dev/video10
+  crw-rw---- 1 root video 81, 13 /dev/video10
+  ```
+  次设备号 13 是 video4linux 子系统内部按**注册顺序**发的流水号
+- **⚠️ 推论：设备文件名里的数字 ≠ 次设备号**。实测：
+  ```
+  video0      → 81:0        video9      → 81:9
+  v4l-subdev0 → 81:10   ← 插队
+  v4l-subdev1 → 81:11
+  v4l-subdev2 → 81:12
+  video10     → 81:13   ← 名字叫 10，次号是 13
+  video11     → 81:14
+  ```
+  更极端的例子：`/dev/ttyS1` 次设备号是 **65**，`/dev/ttyS3` 是 **67**（8250 驱动惯例：`次号 = 64 + 端口号`）
+- **解法**：次设备号**只能从 `ls -l` 或 `/sys/class/<子系统>/<设备>/dev` 读**，绝不从文件名推断
+- **MCU 类比**：主设备号 ≈ 外设基地址（哪个控制器），次设备号 ≈ 控制器下的第几路通道
+- **关联**：`references/hardware.md` §2.6；阶段 1.4 写驱动时需自己 `alloc_chrdev_region()` 申请主次设备号
+
+### K-023 【实测】串口的属组是 `dialout`，不是 `tty`
+- **日期**：2026-09-12
+- **现象**：`/dev/ttyS1` 的属组是 `dialout`，而 `/dev/ttyFIQ0` 的属组是 `tty`。凭直觉加 `tty` 组是无效的
+- **根因**：Ubuntu/Debian 系用 **`dialout`** 组管理串口访问（历史原因，串口最早用于拨号 dial-out）；`tty` 组只管控制终端（console / pts）
+- **解法**：
+  ```bash
+  sudo usermod -aG dialout lihaihui   # 然后重新登录
+  ```
+- **验证**：免 sudo 执行 `stty -F /dev/ttyS3 115200 raw -echo` 不报权限错
+- **关联**：`references/hardware.md` §2.6
+
+### K-024 【实测】`sudo` 也写不进 `/tmp` 里别人的文件——sticky bit + `fs.protected_regular`
+- **日期**：2026-09-12
+- **现象**：在 `/tmp` 做权限实验，`sudo sh -c 'echo SECRET > /tmp/perm-lab.txt'` 失败：
+  ```
+  sh: 1: cannot create /tmp/perm-lab.txt: Permission denied
+  ```
+  诡异点：执行者是 **root**，文件权限是 **666**（全开），仍然被拒
+- **根因**：两道机制叠加——
+  1. `/tmp` 权限位末尾是 `t`（`drwxrwxrwt`）= **sticky bit 目录**
+  2. 内核 `fs.protected_regular = 2`（Ubuntu 22.04 默认）在 sticky 目录内以 `open(O_CREAT)` 打开**已存在且属主不是自己**的普通文件时，直接返回 `EACCES`
+  - 该检查**独立于 DAC 权限位**（故 `666` 无效），**且不受 `CAP_DAC_OVERRIDE` 豁免**（故 root 也拦）
+- **实测证据**（同一目录，权限均为 666）：
+  | 文件属主 | 写入者 | `fs.protected_regular` | 结果 |
+  |---|---|---|---|
+  | `lckfb` | root | 2 | ❌ EACCES |
+  | `root` | root | 2 | ✅ 成功 |
+  | `lckfb` | root | 0（临时关闭） | ✅ 成功 |
+
+  → 唯一决定因素是「**文件属主 == 写入者 fsuid**」，与权限位无关
+- **设计意图**：防「共享目录投毒」——攻击者在 `/tmp` 预置同名文件，诱使 root 程序以 root 权限写入，从而污染 root 写出的内容
+- **解法**：
+  1. **权限/文件实验不要用 `/tmp`**（sticky 目录规则多、不干净），改用私有目录 `mkdir -p ~/perm-lab`
+  2. 确需写他人文件：先 `sudo chown $USER <file>` 拿到属主身份
+  3. 诊断顺序：`ls -ld <目录>`（有没有 `t`）+ `cat /proc/sys/fs/protected_regular`（是不是 2）
+- **`sysctl` 取值**：`0`=不保护 / `1`=有限 / `2`=完全（Ubuntu 默认）
+- **教训**：**权限模型不止一层**——
+  ```
+  第1层 DAC 九位（属主/属组/other）
+  第2层 sticky bit（目录级：管删除 + 管 O_CREAT）
+  第3层 capabilities（CAP_DAC_OVERRIDE 让 root 绕过 DAC）
+  第4层 LSM / protected_* 加固（本坑，且不给 root 开后门）
+  ```
+  **上层检查会在下层放行后继续拦截**。遇到「权限都对却仍 Permission denied」，先查 sticky 位与 `protected_*`
+- **关联**：`references/hardware.md` §2.2；K-017；阶段 1.2 驱动实验
+
 ---
 
 ## 七、待填充区域
@@ -264,7 +337,7 @@
 > 以下是本项目**尚未遇到但很可能遇到**的领域，踩坑后追加。
 
 ### 设备树与 GPIO 复用
-<!-- 新增条目从这里开始，编号接着 K-022 -->
+<!-- 新增条目从这里开始，编号接着 K-024 -->
 
 ### 内存与性能调优
 <!-- ... -->
@@ -278,7 +351,7 @@
 
 | 来源 | 条数 |
 |------|------|
-| 【实测】（本项目亲历） | 6 |
+| 【实测】（本项目亲历） | 9 |
 | 【通用】（已知陷阱，未亲历） | 15 |
 
 > 💡 **启发式观察**：当一个坑被踩过两次，说明它不是"坑"而是"知识盲区"，应该把根因写进 `SKILL.md` 或阶段学习笔记，而不只是记在这里。

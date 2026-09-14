@@ -180,6 +180,50 @@ sudo v4l2-ctl -d /dev/video10 \
 
 ---
 
+### 2.6 串口（UART）（2026-09-12 实测）
+
+> 这一节直接决定阶段 1.3（UART 编程）与阶段 2（ESP32 通信）怎么做。
+
+**设备树中 10 个 UART 控制器，只启用了 2 个**
+
+| 设备树节点 | MMIO 地址 | status | 对应设备节点 | 次设备号 |
+|-----------|----------|--------|-------------|---------|
+| `serial@fe650000` | 0xfe650000 | **okay** | `/dev/ttyS1` | 65 |
+| `serial@fe670000` | 0xfe670000 | **okay** | `/dev/ttyS3` | 67 |
+| `serial@fdd50000` | — | disabled | — | — |
+| `serial@fe660000` | — | disabled | — | — |
+| `serial@fe680000` ~ `fe6d0000` | — | disabled | — | — |
+
+> ⚠️ **`/dev/ttyS0`、`/dev/ttyS2` 不存在**——对应控制器没启用，没有驱动去创建设备节点。
+
+**属性**
+
+| 项 | 值 |
+|----|-----|
+| 驱动 | `dw-apb-uart`（DesignWare APB UART），兼容 16550A |
+| 属主/属组 | `root:dialout`，权限 `crw-rw----` |
+| 次设备号规则 | `次设备号 = 64 + 端口号`（8250 驱动惯例） |
+
+⚠️ **访问串口需要加入 `dialout` 组**（不是 `tty`！）：
+```bash
+sudo usermod -aG dialout lihaihui   # 之后需重新登录
+```
+
+**console 不会占用户串口**
+
+```
+Kernel command line: ... console=ttyFIQ0
+```
+console 是 **`ttyFIQ0`**（Rockchip 专用 FIQ 调试串口，主设备号 253），**不占用 ttyS1/ttyS3**。
+
+**⬜ 待确认（阶段 1.1）**
+- [ ] **哪个 UART 引到了 40PIN/排针？** 需查板卡原理图
+- [ ] 蓝牙 `hci0` 是否占用 ttyS1（`BT_RFKILL` 日志提到 `uart_rts_gpios=77`）
+- [ ] `ttyS1` 的 `failed to request DMA, use interrupt mode` 警告是否影响高波特率
+- [ ] 排针 UART 电平（**必须万用表实测**）
+
+---
+
 ## 3. 待确认的硬件信息（阶段 1.1 必须查清）
 
 > ⚠️ 以下**尚未确认**，动手接线前必须逐条实测。

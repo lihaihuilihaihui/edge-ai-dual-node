@@ -141,6 +141,7 @@ perf stat ./edge_ai_node              # 更细的计数器（若已安装）
 | 4 | RKNN-Toolkit2 环境（x86） | `python3 -c "import rknn"` | 阶段 3 |
 | 5 | ESP-IDF 是否安装 | `idf.py --version` | 阶段 2 |
 | 6 | ~~用户是否已加入 video/render 组~~ | ✅ **2026-09-10 已完成** | — |
+| 7 | 用户是否已加入 **`dialout`** 组（串口访问用，注意不是 `tty`） | `groups` | **阶段 1.3 前必须做** |
 
 > 2026-09-10 已确认：gcc 11.4.0、make、内核头文件、lsusb、v4l2-ctl 均已就绪（见 §2 表）。
 
