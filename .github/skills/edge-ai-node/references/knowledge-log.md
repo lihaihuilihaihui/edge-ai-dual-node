@@ -330,6 +330,28 @@
   **上层检查会在下层放行后继续拦截**。遇到「权限都对却仍 Permission denied」，先查 sticky 位与 `protected_*`
 - **关联**：`references/hardware.md` §2.2；K-017；阶段 1.2 驱动实验
 
+### K-025 【实测】`git switch <commit>` 会被拒绝——进入 detached HEAD 必须显式 `--detach`
+- **日期**：2026-09-16
+- **现象**：想查看某个历史版本的代码，执行 `git switch 2086351` 失败：
+  ```
+  fatal: a branch is expected, got commit '2086351'
+  ```
+- **根因**：`git switch`（git 2.23 引入）**只接受分支名**。它被设计出来的一大动机就是防止用户在不明确的情况下进入 **detached HEAD**（HEAD 直接指向 commit、不属于任何分支）。报错原文里 git 自己就把 "branch" 和 "commit" 当作两种东西
+- **解法**：显式声明意图
+  ```bash
+  git switch --detach 2086351     # 或简写 git switch -d
+  ```
+  验证已进入该状态：
+  ```bash
+  cat .git/HEAD      # 平时是 "ref: refs/heads/master"；此时变成【裸哈希】
+  git status         # 首行变 "HEAD detached at <hash>"
+  git log --oneline  # 标签从 "(HEAD -> master)" 变 "(HEAD)"，箭头消失
+  ```
+  退出：`git switch master`
+- **风险**：detached 状态下的提交**不属于任何分支**，切走后即成孤儿（只能靠 `reflog` 捞回）。适合**只读地查看历史代码**，不适合在此开发
+- **对比**：`git checkout <commit>` 会**默默**进入 detached 状态且不提示——这正是 `checkout` 被拆分为 `switch` / `restore` 的原因
+- **关联**：`docs/session-log.md` 2026-09-16；阶段 1 排查旧版本代码时可能用到
+
 ---
 
 ## 七、待填充区域
@@ -351,7 +373,7 @@
 
 | 来源 | 条数 |
 |------|------|
-| 【实测】（本项目亲历） | 9 |
+| 【实测】（本项目亲历） | 10 |
 | 【通用】（已知陷阱，未亲历） | 15 |
 
 > 💡 **启发式观察**：当一个坑被踩过两次，说明它不是"坑"而是"知识盲区"，应该把根因写进 `SKILL.md` 或阶段学习笔记，而不只是记在这里。
