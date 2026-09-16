@@ -260,3 +260,117 @@ dc3a5b1  docs(skill): 沉淀串口/UART 实测事实与 K-022~K-024 经验   3 f
 
 **经验库累计**：9 条【实测】+ 15 条【通用】
 **练习仓库**：`~/git-lab`（可保留，后续 git 实验都在这里做，不污染项目仓库）
+
+---
+
+## 2026-09-16 · 0.2.3 分支 + 0.2.4 远程
+
+### 0.2.3 分支（练习仓库 `~/git-lab`）
+
+**核心认知：分支 = 一个 41 字节的文件**
+
+```
+HEAD (内容: "ref: refs/heads/master")  →  refs/heads/master (内容: 一个哈希)  →  commit 对象
+```
+
+- `HEAD` 存的是**分支名**；分支文件存的是 **commit 哈希**
+- **提交时被改写的是「当前分支文件」，HEAD 不动**
+- 创建分支 = 复制一个 41 字节文件（对比 SVN 复制整棵目录树）→ 这才是"零成本"的字面含义
+
+**分叉与合并（亲手跑出两种结果）**
+
+| 场景 | 结果 | 历史形状 |
+|------|------|---------|
+| master 未动 | **Fast-forward**：只挪指针，不产生新 commit | 一条直线 |
+| 两边各有新提交 | **三方合并**：产生一个有两个 parent 的新 commit | 分叉再汇合 |
+
+实测图形：
+
+```
+*   b8b1aa5 (HEAD -> master) Merge branch 'feature-a'
+|\
+| * 190a310 (feature-a) feat: 分支继续前进
+* | ddad9ec feat: master 上的改动
+|/
+* 791399e feat: 分支上的改动
+```
+
+- 概念纠正（用户初答）：合并产生的是**新 commit**，不是"新分支"；FF 是挪**分支指针**，不是挪 HEAD
+
+**detached HEAD（拿到铁证）**
+
+- `git switch <commit>` **被拒绝**：`fatal: a branch is expected, got commit`
+  → git 自己在报错里区分 branch / commit
+- 正确姿势：`git switch --detach <commit>`（**必须显式声明意图才放行**，这是 `switch` 替代 `checkout` 的安全动机）
+- 铁证：`cat .git/HEAD` 从 `ref: refs/heads/master` 变成**裸哈希**
+- 其他表现：`git status` 首行变 `HEAD detached at ...`；`git log` 标签从 `(HEAD -> master)` 变 `(HEAD)`——**箭头消失**
+- 风险：此状态下的提交不属于任何分支，切走后成孤儿（只能靠 `reflog` 捞）
+- 现代实践：`checkout` 已拆为 `switch`（切分支）/ `restore`（丢改动）
+
+**⚠️ 重要观察：工作区的改动「不属于任何分支」**
+
+- 实验中反复出现 `M a.txt` 提示——未提交的改动**跟着分支切换来回走**（走了 5 趟以上）
+- git 只在"改动会被覆盖"时才拒绝：`error: Your local changes ... would be overwritten`
+- 所以「切分支前先 `git status`」的真正意义：**别让手上的草稿被提交到错误的分支上**
+
+### 0.2.4 远程（本地伪远程实验，不需要网络与账号）
+
+**核心认知：远程只是「一个名字 + 一个 URL」，git 不关心它是 GitHub 还是本地目录**
+
+实验拓扑：
+
+```
+~/git-lab（开发者 A）──push──► ~/git-remote.git（裸仓库）
+                                    ▲
+~/git-other（B，由 clone 而来）──push──┘
+```
+
+- **裸仓库（`git init --bare`）没有工作区**——只用于被 push/pull，不给人编辑
+- `origin` 只是 `clone` 自动起的**默认名字**，不是关键字
+- `-u`（`--set-upstream`）建立追踪关系，之后 `git push` / `git pull` 无需带参数
+
+**🔑 本节最重要的认知：`origin/master` 是本地文件，是缓存**
+
+实测证据（`git status` 前后"矛盾"）：
+
+```
+push 成功后：  Your branch is up to date with 'origin/master'.    ← 但远程早已是新 commit
+git fetch 后： Your branch is behind 'origin/master' by 1 commit  ← 这时才同步下来
+```
+
+- 文件位置：`.git/refs/remotes/origin/master`
+- 含义：「**上次与远程通信时**，远程 master 指向哪个 commit」→ **可能过时，不是实时状态**
+
+**fetch vs pull（用输出箭头一眼分辨）**
+
+```
+git fetch  →   b8b1aa5..dc29320  master -> origin/master    ← 只更新本地缓存，不碰工作区
+git pull   →   Updating b8b1aa5..dc29320  Fast-forward      ← 额外把改动展开到工作区
+```
+
+- `fetch` 后 `git log --oneline` **看不到**远程新提交（不在当前分支链上）；`git log --all` 能看到
+- `fetch` 后工作区**没有**新文件；`pull` 之后才有 → **fetch 动的是数据库，pull 额外动了你的文件**
+
+### 进度
+
+| 小节 | 状态 |
+|------|------|
+| 0.1 环境体检与权限 | ✅ 结课 |
+| 0.2.1 三层模型 | ✅ |
+| 0.2.2 命令与数据模型 | ✅ |
+| 0.2.3 分支 | ✅ |
+| 0.2.4 远程 | ✅ |
+| 0.2.5 撤销 | ⬜ **下一个** |
+| 0.6 首次推送 GitHub | ⬜ |
+
+### ⏭️ 下次起点
+
+1. **0.2.5 撤销**：`restore` / `reset` / `revert` 的区别（`reset --hard` 是 git 里最容易丢代码的命令）
+   - 素材现成：`~/git-lab` 里正堆着「未提交改动 + 多分支 + 远程」的活场景
+2. **0.6 推 GitHub 前需确认**：GitHub 账号 + 认证方式（HTTPS token 或 SSH key）——这才是"密钥"真正登场的时机
+3. 待办未清：哪个 UART 引到排针？蓝牙 `hci0` 是否占用 `ttyS1`？（阶段 1.3 前）
+4. 待下单：SG90 **180°** 舵机 ×2 + 二轴云台支架 + 杜邦线 + 独立 5V 电源（~50 元）
+
+**练习仓库**：`~/git-lab`（开发 A）、`~/git-other`（模拟另一台电脑）、`~/git-remote.git`（裸仓库当远程）
+
+**经验库累计**：10 条【实测】+ 15 条【通用】
