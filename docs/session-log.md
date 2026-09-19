@@ -465,3 +465,145 @@ git 自动写入 `This reverts commit 613fe88...` → **可追溯（审计价值
 **练习仓库**：`~/git-lab`（开发 A）、`~/git-other`（模拟另一台电脑）、`~/git-remote.git`（裸仓库当远程）
 **学习笔记**：`stage0-toolchain/docs/0.2-git-notes.md`（0.2 全节复习卡）
 **经验库累计**：11 条【实测】+ 15 条【通用】
+
+---
+
+## 2026-09-19 · 0.6 推送 + 0.4 Makefile + 0.3 交叉编译 + 0.5 vim
+### 🎉 阶段 0 全部完成
+
+---
+
+### 0.6 首次推送到 GitHub ✅
+
+- `ssh-keygen -t ed25519` 生成密钥对；私钥 `600`、公钥 `644`（私钥权限被 SSH 严格检查）
+- 公钥上传 GitHub → `ssh -T git@github.com` 认证成功
+  - 首次连接的 host key 确认是 **TOFU 机制**：验证的是「**服务器是不是真的 GitHub**」（防中间人），不是"你是谁"
+- `git branch -M main` → `git remote add origin git@github.com:lihaihuilihaihui/edge-ai-dual-node.git`
+- `git push -u origin main` → **79 objects / 76.22 KiB 成功**
+- ✅ **「commit ≠ 备份」的缺口正式关闭**（本地 + GitHub 两份物理副本）
+
+**讲清的机制**：
+- 建仓不勾 `Add a README` 的原因：远程若有 commit，两条历史**无共同祖先** → push 被拒
+- **push 的本质是"把远程指针往前挪"，不能抹掉远程已有的 commit** → 所以要求 fast-forward
+- 踩坑小记：粘贴占位符时把 `<` `>` `!` 一起带进命令 → 尖括号是占位符标记，`!` 在 bash 里是历史扩展
+
+### 0.4 Makefile 与构建 ✅
+
+用户**独立写出生产级 Makefile**（`stage0-toolchain/practice/make-lab/`）：
+
+```makefile
+CC      = gcc
+CFLAGS  = -Wall -g -MMD -MP
+TARGET  = app
+OBJS    = main.o a.o b.o
+DEPS    = $(OBJS:.o=.d)
+
+all: $(TARGET)
+$(TARGET): $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $^
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+.PHONY: clean
+clean:
+	rm -f $(TARGET) $(OBJS) *.d
+-include $(DEPS)
+```
+
+**实测数据（关键验收）**：
+
+| 操作 | 结果 | 说明 |
+|------|------|------|
+| `make` 首次 | 3 编译 + 1 链接 | |
+| `make` 再次 | `Nothing to be done` | 时间戳判断生效 |
+| `touch a.c && make` | **只重编 a.o + 链接（共 2 条）** | ★ 核心验收 |
+| `touch a.h && make`（修复前） | `Nothing to be done` | ⚠️ 头文件盲区实证 |
+| `touch a.h && make`（修复后） | **重编 main.o + a.o** | ★ 传递依赖被捕捉 |
+
+**重大发现：`main.d` 暴露了传递依赖**
+```
+main.o: main.c a.h b.h        ← main.c 也 include 了 a.h！
+```
+- 手工写依赖极易漏掉 `main.o: a.h` → 改头文件不重编 → **编译通过但行为诡异**
+- **`-MMD` 让编译器（真正读 `#include` 的那个程序）来回答依赖问题**，从根上杜绝遗漏
+- **精确性验证**：`touch a.h` 只重编 main.o+a.o（**b.o 不动**）；`touch b.h` 只重编 main.o+b.o（**a.o 不动**）
+- **自举机制**：首次编译时 `.d` 不存在（`-include` 静默跳过），编译"顺带"产出 `.d`，第二次起生效
+
+**纠错**：用户初版 `%.o: %.c` 只写 `-c $<`（缺 `-o $@`）——当前项目恰好能跑（gcc 默认命名），但换成 `build/%.o: src/%.c` 立刻失败。已指出。
+
+### 0.3 交叉编译 ✅
+
+**认知锚点（用户自己问出来的）**：
+> 「我之前用 Keil 编译开发板代码时，是软件默认的交叉编译吗？」
+
+**是的**——`arm-none-eabi-gcc` 就是交叉编译器。Keil 把「工具链 + sysroot + 链接脚本」全自动配好了；Linux 下这些要自己管。**错误类型也一一对应**（`undefined symbol` ↔ `undefined reference`）。
+
+**环境实测**：
+
+| 项 | 结果 |
+|----|------|
+| 虚拟机架构 | `x86_64` |
+| 交叉工具链 | `aarch64-linux-gnu-gcc` **11.4.0**（与板卡 gcc 版本一致 ✅，无 glibc 版本风险） |
+| 网络 | 板卡 `192.168.31.151`（LAN）／虚拟机 `192.168.27.128`（VMware NAT） |
+| 传输通路 | ✅ **虚拟机 → `scp` → 板卡** 已实测可通 |
+| 虚拟机额外能力 | 装了 **QEMU user-mode + binfmt_misc**，直接执行 aarch64 程序会尝试 QEMU 模拟 |
+| ⚠️ 板卡缺 | **`file`**（已 `apt install -y file`） |
+
+**实操链路（全部打通）**：
+```
+x86 上 aarch64-linux-gnu-gcc 编译 → scp 到板卡 → ./hello-arm64 运行成功
+输出：Hello from aarch64 (ARMv8 64-bit)!
+```
+
+**核心知识点**：
+
+1. **sysroot ≠ 运行时库**：
+   - `/usr/aarch64-linux-gnu/lib/` → **编译链接时**用（交叉链接器找 `-lc`）
+   - `/lib/` → **运行时**用（内核/动态链接器加载）
+   - 实测：虚拟机 `/lib/ld-linux-aarch64.so.1` **不存在** → 报 `aarch64-binfmt-P: Could not open ...`；板卡上它就是本机链接器 → 运行成功
+2. **架构由工具链决定，不由源码决定**（用户初答"条件编译决定架构"→ 因果反了）
+   - 因果链：`用哪条工具链 → 编译器预定义哪个宏 → 源码走哪个分支`
+3. `file` 输出关键两处：**架构名** + **interpreter 路径**（ELF 头里写死的动态链接器）
+4. **`ldd` 不能用于跨架构诊断**（本质是脚本，会尝试执行目标程序）→ 用 `aarch64-linux-gnu-readelf -d`
+
+**两个意外收获**：
+- 用户 `hello.c` 把 `__aarch64__` 拼成 `__arrch64__` → **在 x86 上"看起来正常"（第二分支接住），到板子上才暴露** → 活教材：有些 bug 只有目标平台能暴露
+- 解析工具输出必须加 `LC_ALL=C`（中文 locale 会把 `readelf` 的 `Class/Machine/Type` 翻译掉，grep 全空）→ **K-027**
+
+### 0.5 vim 生存技能 ✅
+
+- 掌握：模式切换（`i`/`a`/`o` ↔ `Esc`）、`dd`、`yy`+`p`、`/搜索`、`:wq`、**`:q!` 救命**
+- **心法**：vim 是 `[动词][数量][名词]` 的语法（`d3w`/`3dd`），不是命令清单
+- **救命三步**：`Esc`（按几次）→ `:q!` → 回车
+- 第 7 关（救命练习）通过：乱改后 `:q!` 干净逃出，文件内容未受影响 ✅
+- VS Code 分屏 + `tail -f` 实测通过（**tmux 暂不学**——阶段 3 长稳测试需要会话持久化时再说）
+- `grep -rn` / `find` 实测通过
+- ⬜ **遗留**：`:%s/line/row/g` 全文替换那一关没做，下次顺手补
+
+### 进度
+
+| 小节 | 状态 |
+|------|------|
+| 0.1 环境体检与权限 | ✅ |
+| 0.2 git 工作流（0.2.1~0.2.5） | ✅ |
+| 0.3 交叉编译 | ✅ |
+| 0.4 Makefile 与构建 | ✅ |
+| 0.5 终端与 vim | ✅（`:%s///g` 待补） |
+| 0.6 项目骨架与首次推送 | ✅ |
+| **阶段 0** | 🎉 **全部完成** |
+
+### ⏭️ 下次起点：**阶段 1（RK3566 Linux 底层）**
+
+按 [`COLLABORATION.md`](../docs/COLLABORATION.md) §3，进入新阶段前 Copilot 必须先产出：
+1. 阶段 1 **学习地图**（分几节、先后依赖）
+2. **原理总览**（架构图 + 关键概念通俗解释）
+3. **验收清单**（做完能演示什么）
+4. **预计时间**（按每天 1-1.5h 折算）
+
+等用户回复"确认，开始"后，才进入 1.1（板载 GPIO/LED/按键：libgpiod）。
+
+**待办未清**：
+- ⬜ `:%s///g` 练习（0.5 遗留）
+- ⬜ 哪个 UART 引到排针？蓝牙 `hci0` 是否占用 `ttyS1`？
+- ⬜ 下单：SG90 **180°** 舵机 ×2 + 二轴云台支架 + 杜邦线 + 独立 5V 电源（阶段 2 前到货即可）
+
+**经验库累计**：13 条【实测】+ 15 条【通用】
