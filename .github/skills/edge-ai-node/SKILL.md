@@ -78,6 +78,7 @@ argument-hint: '[问题描述或"下一步"]'
 ### 目录规则
 ```
 stage0-toolchain/       工具链练习
+  practice/<练习名>/     ← 阶段0 练习项目（源码入库，产物 gitignore）
 stage1-rk3566/
   drivers/<模块名>/     内核模块（含自己的 Makefile 与 README）
   apps/<应用名>/        src/ + model/ + conf/ + Makefile
@@ -86,6 +87,10 @@ stage2-esp32/           ESP-IDF 工程
 stage3-ai/              模型转换脚本 + 推理代码
 scripts/                辅助脚本（交叉编译、部署、压测）
 ```
+
+> ⚠️ **练习项目一律建在仓库内**（`stage0-toolchain/practice/<名字>/`），**不要放 `$HOME`**。
+> 原因：用户用 VS Code 打开的是仓库根目录，`$HOME` 下的文件在编辑器里编辑不方便。
+> 例外：纯命令行操作的独立 git 实验仓库（如 `~/git-lab`）留在 `$HOME` —— 独立仓库嵌入工作区会造成嵌套仓库问题。
 
 ### 数据与产物
 - 大文件（模型、数据集、录像）放 `/mnt/tfcard/workspace/edge-ai-node/`

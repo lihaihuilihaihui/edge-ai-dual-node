@@ -56,6 +56,10 @@ tmp/
 !docs/**/*.png
 !docs/**/*.jpg
 
+# 阶段0 练习项目的产物（源码要提交，产物不提交）
+stage0-toolchain/practice/**/app
+stage0-toolchain/practice/**/*.d
+
 # 系统备份镜像
 *.img.gz
 backup/
