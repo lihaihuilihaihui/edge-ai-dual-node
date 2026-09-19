@@ -372,6 +372,57 @@
 - **解法 / 自保策略**：**舍不得的改动，先 `git commit`（不是先 `git add`）。** commit 是廉价的，丢掉的代码是昂贵的
 - **关联**：`docs/session-log.md` 2026-09-18；`stage0-toolchain/docs/0.2-git-notes.md`
 
+### K-027 【实测】解析工具输出必须加 `LC_ALL=C`——中文 locale 会翻译字段名
+- **日期**：2026-09-19
+- **现象**：中文 locale 的 Ubuntu 上执行
+  ```bash
+  readelf -h hello-arm64 | grep -E "Class|Machine|Type"
+  ```
+  **完全没有输出**，但单独跑 `readelf -h` 明明有内容
+- **根因**：GNU binutils 自带中文翻译，`readelf` 会把字段名译成中文：
+  ```
+  Class:   →  类别:
+  Machine: →  机器:
+  Type:    →  类型:
+  ```
+  于是 grep 英文关键词全部匹配失败。同理 `ldd` 输出 `不是动态可执行文件`（英文为 `not a dynamic executable`）
+- **解法**：**任何要解析工具输出的场合，一律强制英文 locale**
+  ```bash
+  LC_ALL=C readelf -h hello-arm64 | grep -E "Class|Machine|Type"
+  ```
+- **教训**：**脚本里永远不要依赖本机 locale**。要 grep 工具输出、比较报错字符串、写 CI/构建脚本时，先 `LC_ALL=C`
+- **关联**：`docs/session-log.md` 2026-09-19；阶段 1 写构建脚本时会用到
+
+### K-028 【实测】交叉编译的产物在开发机上"跑不了"是正常现象——别误判为编译失败
+- **日期**：2026-09-19
+- **现象**：x86 虚拟机上交叉编译出 aarch64 的 `hello-arm64`，直接执行报错：
+  ```
+  aarch64-binfmt-P: Could not open '/lib/ld-linux-aarch64.so.1': No such file or directory
+  ```
+  看起来像"编译失败"，但 `file` 显示产物架构完全正确；同一文件 `scp` 到板卡后**运行成功**
+- **根因**：**「编译成功」与「能在某台机器上运行」是两个独立条件**
+  - 交叉编译只保证**架构正确**（ELF 头的 `e_machine`）
+  - 能否运行取决于**当前机器的运行时环境**：动态链接器（`/lib/ld-linux-aarch64.so.1`）+ 兼容版本的 libc
+  - 开发机是 x86，`/lib/` 下只有 x86 链接器 → 自然跑不起来
+  - （本机额外装了 QEMU user-mode + binfmt_misc，故内核没报 `Exec format error`，而是转交 QEMU 模拟、由 QEMU 报"找不到链接器"）
+- **关键区分：sysroot vs 运行时库**
+
+  | 位置 | 谁在用 | 何时 |
+  |------|--------|------|
+  | `/usr/aarch64-linux-gnu/lib/`（sysroot） | 交叉**链接器** | **编译时** |
+  | `/lib/`（系统根） | 内核 / 动态链接器 | **运行时** |
+
+- **解法 / 正确做法**：
+  1. 验证产物是否正确 → `file` 看架构；`aarch64-linux-gnu-readelf -h` 看 `Machine`
+  2. 验证能否运行 → **必须到目标机器上跑**（或 `qemu-aarch64-static -L /usr/aarch64-linux-gnu ./prog` 本地模拟）
+  3. 跨架构诊断**不要用 `ldd`**（它是脚本，会尝试执行目标程序）→ 用 `aarch64-linux-gnu-readelf -d`
+- **延伸风险**：即使架构对、能启动，若工具链 sysroot 里的 glibc 与板卡 glibc **版本不匹配**，仍会报
+  ```
+  ./app: /lib/aarch64-linux-gnu/libc.so.6: version `GLIBC_2.xx' not found
+  ```
+  本项目两套环境同为 Ubuntu 22.04 / gcc 11.4.0，暂未遇到；**阶段 1~3 需留意**
+- **关联**：`docs/session-log.md` 2026-09-19；K-015；阶段 1.4 部署用户态应用
+
 ---
 
 ## 七、待填充区域
@@ -393,7 +444,7 @@
 
 | 来源 | 条数 |
 |------|------|
-| 【实测】（本项目亲历） | 11 |
+| 【实测】（本项目亲历） | 13 |
 | 【通用】（已知陷阱，未亲历） | 15 |
 
 > 💡 **启发式观察**：当一个坑被踩过两次，说明它不是"坑"而是"知识盲区"，应该把根因写进 `SKILL.md` 或阶段学习笔记，而不只是记在这里。

@@ -8,11 +8,37 @@
 
 | 主机 | 用途 | 说明 |
 |------|------|------|
-| **RK3566 板卡**（`lckfb`） | 板端开发、运行、调试 | VS Code Server 直连，每个终端都在板子上跑 |
-| **x86 主机**（`lihaihui-virtual-machine`） | 内核交叉编译（已完成 2026-09-04）；后续 RKNN 模型转换 | 性能强，适合跑 RKNN-Toolkit2 |
+| **Windows 宿主机** | 仅作虚拟机宿主 | **不在上面开发**（PowerShell 里没有 Unix 命令） |
+| **Ubuntu 虚拟机**（`lihaihui-virtual-machine`，VMware） | 交叉编译；后续 RKNN 模型转换 | x86_64 / Ubuntu 22.04 / **gcc 11.4.0** |
+| **RK3566 板卡**（`lckfb`） | 板端开发、运行、调试 | VS Code Server 直连，终端命令默认在板端执行 |
+
+### 网络拓扑（2026-09-19 实测）
+
+| 机器 | 地址 | 网段 |
+|------|------|------|
+| Ubuntu 虚拟机 | `192.168.27.128` | VMware NAT（192.168.27.0/24） |
+| RK3566 板卡 | `192.168.31.151` | 家庭局域网（192.168.31.0/24） |
+
+- ✅ **传输通路：虚拟机 → `scp` → 板卡**（已实测可用）
+  ```bash
+  # 在【虚拟机】上执行（在源文件目录里）
+  scp <文件> lihaihui@192.168.31.151:~/
+  ```
+- ❌ 反向（板卡 → 虚拟机）不通：NAT 下的虚拟机无法被外部主动连接
+- 如需双向：把 VMware 网络适配器改为**桥接模式**（虚拟机会获得 192.168.31.x 地址）
+
+### SSH 密钥（2026-09-19 生成）
+
+| 文件 | 权限 | 用途 |
+|------|------|------|
+| `~/.ssh/id_ed25519` | `600` | **私钥**——绝不外传 |
+| `~/.ssh/id_ed25519.pub` | `644` | 公钥——已添加到 GitHub 账号 |
+
+- 用途：推送 `edge-ai-dual-node` 到 GitHub（`git@github.com:lihaihuilihaihui/edge-ai-dual-node.git`）
+- 尚未添加到板卡。若想免密 `scp`，把公钥内容追加到板卡 `~/.ssh/authorized_keys` 即可
 
 > ⚠️ 当前 VS Code 直接连在板卡上，**终端命令默认在板端执行**。
-> 涉及交叉编译的命令需要 SSH 到 x86 主机。
+> 涉及交叉编译的命令要在 **Ubuntu 虚拟机**里执行。
 
 ---
 
@@ -28,6 +54,7 @@
 | git | 已安装（2026-09-09） | `git --version` |
 | lsusb | ✅ 已装 (`usbutils`) | `command -v lsusb` |
 | v4l2-ctl | ✅ 已装 (`v4l-utils`) | `command -v v4l2-ctl` |
+| **file** | ⚠️ 镜像原本**缺失**，2026-09-19 已 `apt install -y file` | `command -v file` |
 | uvcvideo | ✅ 内置已注册（`CONFIG_USB_VIDEO_CLASS=y`） | `ls -d /sys/module/uvcvideo` |
 | NPU 驱动 | ✅ rknpu 0.9.8 已加载（`CONFIG_ROCKCHIP_RKNPU=y`） | `dmesg \| grep -i rknpu` |
 
@@ -63,7 +90,7 @@
 | 编译主机 | `lihaihui-virtual-machine`（x86） |
 | 内核版本 | 6.1.141 |
 | 完成日期 | 2026-09-04 |
-| 交叉工具链 | 待补充（记录具体前缀，如 `aarch64-linux-gnu-`） |
+| 交叉工具链 | `aarch64-linux-gnu-` **11.4.0**（2026-09-19 实测；**与板卡 gcc 版本一致**，无 glibc 版本冲突风险） |
 | 配置来源 | 待补充（defconfig 文件路径） |
 
 > 📌 **阶段 3 前置**：确认内核配置包含 NPU 支持
