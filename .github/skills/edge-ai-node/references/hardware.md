@@ -216,26 +216,118 @@ Kernel command line: ... console=ttyFIQ0
 ```
 console 是 **`ttyFIQ0`**（Rockchip 专用 FIQ 调试串口，主设备号 253），**不占用 ttyS1/ttyS3**。
 
-**⬜ 待确认（阶段 1.1）**
-- [ ] **哪个 UART 引到了 40PIN/排针？** 需查板卡原理图
-- [ ] 蓝牙 `hci0` 是否占用 ttyS1（`BT_RFKILL` 日志提到 `uart_rts_gpios=77`）
+**✅ 已确认（2026-09-20 实测，09-12 遗留问题闭环）**
+
+| 控制器 | 地址 | 设备节点 | 占用的引脚 | 用途 | 可用？ |
+|--------|------|---------|-----------|------|--------|
+| `uart1` | `fe650000` | `/dev/ttyS1` | `gpio2-11/12/13/14` | **蓝牙 hci0**（`wireless-bluetooth`，含 RTS/CTS） | ❌ 不可用 |
+| `uart2` | `fe660000` | — | `gpio0-24/25` | **console（`fiq-debugger`）** | ❌ 绝对不可碰 |
+| `uart3` | `fe670000` | **`/dev/ttyS3`** | `gpio3-15/16` | ★ **排针引脚 8(TX) / 10(RX)** | ✅ **阶段 2 专用** |
+
+- ✅ **哪个 UART 引到排针** → **`ttyS3`**（对应排针引脚 8 / 10）——09-12 遗留问题解决
+- ✅ **蓝牙是否占用 ttyS1** → **是**（`wireless-bluetooth` 独占 uart1）——09-12 遗留问题解决
+
+**⬜ 仍未确认**
 - [ ] `ttyS1` 的 `failed to request DMA, use interrupt mode` 警告是否影响高波特率
-- [ ] 排针 UART 电平（**必须万用表实测**）
+- [ ] 排针 UART 电平（**必须万用表实测**；决定是否需要电平转换）
 
 ---
 
-## 3. 待确认的硬件信息（阶段 1.1 必须查清）
+### 2.7 40PIN 排针引脚分配（2026-09-20 实测 + 原理图交叉验证）
 
-> ⚠️ 以下**尚未确认**，动手接线前必须逐条实测。
+> **数据来源**：板卡原理图引脚功能表 + 内核实测（`/sys/kernel/debug/pinctrl/*/pinmux-pins`）——**两者交叉验证一致** ✅
 
-| # | 待确认项 | 怎么查 | 风险 |
-|---|---------|--------|------|
-| 1 | 排针上可用的 UART 是哪一组？设备节点是 `/dev/ttyS?` | `ls /dev/ttyS*` + `sudo cat /sys/kernel/debug/gpio` + 查板卡原理图 | 用错节点收不到数据 |
-| 2 | 该 UART 是否被调试串口占用 | `cat /proc/cmdline` 看 `console=`；`dmesg \| grep ttyS` | 冲突导致系统日志污染串口 |
-| 3 | 排针 UART 电平（3.3V 还是 5V） | **万用表实测** | 5V 直连 ESP32 会损坏 GPIO |
-| 4 | 摄像头买回后的设备节点与像素格式 | `v4l2-ctl --list-devices`；`v4l2-ctl -d /dev/videoN --list-formats-ext` | 格式不支持则无法采集 |
-| 5 | 可用 GPIO 编号（用于驱动实验） | `sudo cat /sys/kernel/debug/gpio`；查原理图 | 复用冲突 |
-| 6 | 板端是否有 `librknnrt.so` 及其版本 | `find / -name "librknnrt*" 2>/dev/null` | 与 PC 端 RKNN-Toolkit2 版本不匹配则推理失败 |
+#### ★ 本项目选定 / 保留的引脚
+
+| 排针引脚 | 引脚名 | 全局编号 | gpiochip:line | 分配 |
+|---|---|---|---|---|
+| **11** | `GPIO3_A1` | 97 | **`gpiochip3:1`** | ★ **本项目 GPIO 实验/自定义 IO** |
+| **8 / 10** | `GPIO3_B7` / `GPIO3_C0` | 111 / 112 | `gpiochip3:15 / 16` | ★ **阶段 2 串口（`/dev/ttyS3`）——保留禁用** |
+
+#### 可用 GPIO（实测 `MUX UNCLAIMED` + `GPIO UNCLAIMED`）
+
+| 排针 | 引脚名 | 全局编号 | `gpiochip3` line |
+|---|---|---|---|
+| **11** | `GPIO3_A1` | 97 | **1** ★ |
+| 13 | `GPIO3_A2` | 98 | 2 |
+| 15 | `GPIO3_A3` | 99 | 3 |
+| 16 | `GPIO3_A4` | 100 | 4 |
+| 18 | `GPIO3_A5` | 101 | 5 |
+| 22 | `GPIO3_A6` | 102 | 6 |
+| 26 | `GPIO3_A7` | 103 | 7 |
+| 29 | `GPIO3_B0` | 104 | 8 |
+| 38 | `GPIO3_B3` | 107 | 11 |
+| 40 | `GPIO3_B4` | 108 | 12 |
+| 36 | `GPIO3_C3` | 115 | 19 |
+
+> 其它可用的非 gpio3 引脚：**7 = `GPIO1_A4`**、**37 = `GPIO0_B7`**
+
+#### ⚠️ 已被内核占用（**不可动用**）
+
+| 排针 | 引脚名 | 占用者 | 说明 |
+|---|---|---|---|
+| **8 / 10** | `GPIO3_B7` / `GPIO3_C0` | **`uart3` (ttyS3)** | ★ 阶段 2 专用，保留 |
+| 3 / 5 | `GPIO0_B6` / `GPIO0_B5` | `i2c2` | I2C2 总线 |
+| 27 / 28 | `GPIO3_B6` / `GPIO3_B5` | `i2c3` | I2C3 总线 |
+| 12 | `GPIO3_C4` | `pwm14` | PWM14 |
+| 32 | `GPIO3_C5` | `pwm15` | PWM15 |
+| 33 / 35 | `GPIO3_B1` / `GPIO3_B2` | `pwm8` | PWM8 |
+| 19 / 21 / 23 / 24 | `GPIO4_*` | `spi3` | SPI3 总线 |
+
+#### 电源与地
+
+| 引脚 | 功能 |
+|---|---|
+| 1 / 17 | 3.3V |
+| 2 / 4 | 5V |
+| 6 / 9 / 14 / 20 / 25 / 30 / 34 / 39 | GND |
+
+#### Rockchip 引脚编号换算（实用）
+
+```
+GPIO3_A1  →  bank=3, 组=A(组序0), 组内序号=1
+全局编号 = bank×32 + 组序×8 + 序号 = 3×32 + 0×8 + 1 = 97
+gpiochip3 的 line = 97 − 96 = 1          （96 = bank3 的全局起始编号）
+```
+组序：`A=0, B=1, C=2, D=3`
+
+#### 探测方法（可复现）
+
+```bash
+# ★ 每个引脚的复用归属（唯一能看出"真的空闲"的命令）
+sudo cat /sys/kernel/debug/pinctrl/*/pinmux-pins
+
+# 只看某个 bank
+sudo cat /sys/kernel/debug/pinctrl/*/pinmux-pins | grep -E "\(gpio3-"
+
+# GPIO 线的占用者（⚠️ unused ≠ 引脚空闲！UART/I2C 不走 gpiod 接口）
+sudo gpioinfo gpiochip3
+
+# 统计真正空闲的线数（-w 全词匹配，否则 "unused" 会被 "used" 误匹配）
+sudo gpioinfo | grep -cw unused
+```
+
+> ⚠️ **判断引脚能否使用，必须看 `pinmux-pins` 里的 `UNCLAIMED`**；
+> 只看 `gpioinfo` 的 `unused` 会得出错误结论（UART/I2C/PWM 子系统不通过 gpiod 接口申请引脚）。
+
+---
+
+## 3. 待确认的硬件信息
+
+| # | 待确认项 | 怎么查 | 风险 | 何时必须做 |
+|---|---------|--------|------|-----------|
+| 1 | **排针 UART 电平（3.3V 还是 5V）** | **万用表实测** | 5V 直连 ESP32 会损坏 GPIO | ⚠️ **阶段 2 接线前** |
+| 2 | `ttyS1` 的 DMA 警告是否影响高波特率 | 长时间压测收发 | 高波特率下丢数据 | 阶段 2 |
+| 3 | 板端 `librknnrt.so` 版本 | `find / -name "librknnrt*" 2>/dev/null` | 与 PC 端 RKNN-Toolkit2 不匹配则推理失败 | 阶段 3 |
+
+**✅ 已确认（移出本表）**：
+
+| 原待确认项 | 结论 | 日期 |
+|-----------|------|------|
+| 排针上可用的 UART | **`/dev/ttyS3`**（对应排针引脚 8 / 10） | 2026-09-20 |
+| 是否被 console 占用 | **否**——console 是 `ttyFIQ0`（uart2），不占 ttyS1/ttyS3 | 2026-09-12 |
+| 摄像头设备节点与格式 | `/dev/video10`，MJPG 640×480@30fps 稳态 | 2026-09-10 |
+| 可用 GPIO 编号与复用状态 | 见 §2.7；选定 **排针 11 = `GPIO3_A1` = `gpiochip3:1`** | 2026-09-20 |
 
 ---
 

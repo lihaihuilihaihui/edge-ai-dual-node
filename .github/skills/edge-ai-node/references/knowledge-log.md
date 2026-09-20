@@ -423,6 +423,32 @@
   本项目两套环境同为 Ubuntu 22.04 / gcc 11.4.0，暂未遇到；**阶段 1~3 需留意**
 - **关联**：`docs/session-log.md` 2026-09-19；K-015；阶段 1.4 部署用户态应用
 
+### K-029 【实测】`gpioinfo` 显示 `unused` ≠ 引脚空闲——判据是 `pinmux-pins`
+- **日期**：2026-09-20
+- **现象**：探测 RK3566 可用 GPIO 时，`sudo gpioinfo gpiochip3` 显示 line 0~31 **全部是 `unused`**，据此判断"整个 bank 都空闲可用"——**结论错误**
+  - 实际上 `gpiochip3` 的 line 13/14 被 `i2c3` 占用、line 15/16 被 `uart3` 占用、line 21 被 `pwm15` 占用……
+  - 差点把**阶段 2 要用的串口引脚**（排针 8/10 = `uart3`）当成普通 GPIO 拿去做实验
+- **根因**：`gpioinfo` 的 `used/unused` 只表示**"有没有人通过 gpiod 字符设备接口 request 这条线"**
+  - **UART / I2C / SPI / PWM 等子系统不通过 gpiod 接口申请引脚**——它们在 `pinctrl` 层就把引脚**复用**给了自己的控制器
+  - 于是它们在 `gpioinfo` 里显示为 `unused`，但引脚实际已被占用
+- **正确做法**：查 `pinctrl` 的 pinmux 归属
+  ```bash
+  sudo cat /sys/kernel/debug/pinctrl/*/pinmux-pins
+  ```
+  | 输出样例 | 含义 |
+  |---|---|
+  | `pin 97 (gpio3-1): (MUX UNCLAIMED) (GPIO UNCLAIMED)` | ✅ 真空闲 |
+  | `pin 111 (gpio3-15): fe670000.serial ... function uart3 group uart3m1-xfer` | ❌ 已被串口占用 |
+  | `pin 4 (gpio0-4): fe2b0000.mmc ... function sdmmc0 group sdmmc0-det` | ⚠️ 被 SD 卡检测占用 |
+- **附带坑：`grep -c "used"` 会把 `unused` 也算进去**
+  ```bash
+  sudo gpioinfo | grep -c "used"      # ❌ 160（全部引脚，因为 "unused" 含子串 "used"）
+  sudo gpioinfo | grep -cw unused     # ✅ 146（-w 全词匹配）
+  ```
+  **统计关键词出现次数时一律加 `-w`**，否则子串会污染结果
+- **教训**：**"没被申请" ≠ "没被使用"**。判断资源是否可用，要查**真正负责分配它的那一层**（这里是 pinctrl），而不是某个上层接口的视图
+- **关联**：`references/hardware.md` §2.7；K-019（不要从间接证据推断硬件事实）
+
 ---
 
 ## 七、待填充区域
@@ -444,7 +470,7 @@
 
 | 来源 | 条数 |
 |------|------|
-| 【实测】（本项目亲历） | 13 |
+| 【实测】（本项目亲历） | 14 |
 | 【通用】（已知陷阱，未亲历） | 15 |
 
 > 💡 **启发式观察**：当一个坑被踩过两次，说明它不是"坑"而是"知识盲区"，应该把根因写进 `SKILL.md` 或阶段学习笔记，而不只是记在这里。
