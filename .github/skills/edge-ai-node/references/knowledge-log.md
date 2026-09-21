@@ -449,6 +449,53 @@
 - **教训**：**"没被申请" ≠ "没被使用"**。判断资源是否可用，要查**真正负责分配它的那一层**（这里是 pinctrl），而不是某个上层接口的视图
 - **关联**：`references/hardware.md` §2.7；K-019（不要从间接证据推断硬件事实）
 
+### K-030 【实测】udev 规则的 `GROUP` 依赖组存在，不存在则**静默忽略**；且 `newgrp` 只影响当前 shell
+- **日期**：2026-09-21
+- **现象**：为 `/dev/gpiochip*` 写了 udev 规则
+  ```
+  SUBSYSTEM=="gpio", KERNEL=="gpiochip*", GROUP="gpio", MODE="0660"
+  ```
+  执行 `udevadm control --reload-rules && udevadm trigger` 后：
+  ```
+  crw-rw---- 1 root root    ← 权限 600→660 生效了，但属组还是 root
+  ```
+  **MODE 生效、GROUP 没生效**
+- **根因**：**`gpio` 组不存在**（`getent group gpio` 为空）。udev 找不到该组时**只记一行日志就跳过 GROUP**，其余动作（如 MODE）照常执行
+  ```bash
+  sudo journalctl -b | grep -iE "udev.*(error|unknown|invalid)"
+  # → systemd-udevd: /etc/udev/rules.d/99-gpiochip.rules:1 Unknown group 'gpio', ignoring
+  ```
+  **udev 的失败是静默的**（开机要处理成百上千设备，不能因一条规则卡住）→ **排查 udev 问题必须看日志**
+- **解法**（顺序很重要）：
+  ```bash
+  sudo groupadd gpio                  # ① 先建组
+  sudo usermod -aG gpio $USER         # ② 把自己加进去
+  sudo udevadm control --reload-rules # ③ 重载规则
+  sudo udevadm trigger                # ④ 重新触发设备创建
+  ls -l /dev/gpiochip3                # ⑤ 验证：crw-rw---- 1 root gpio
+  ```
+- **附带的坑：`newgrp` 的作用域有限**
+  - `newgrp gpio` 只在**当前 shell 及其子进程**生效
+  - **VS Code 分屏新开的终端是独立会话，不继承组身份** → 表现为 `gpioset: Permission denied`
+  - 长期解决：**重启 VS Code Server 或重连**（让组关系对新会话生效）
+- **关联**：`references/hardware.md` §2.7；`stage1-rk3566/docs/1.1-gpio-notes.md`；K-017（权限模型）
+
+### K-031 【实测】改动 sysfs 状态前必须先记录原始值——LED 触发器改坏了不容易还原
+- **日期**：2026-09-21
+- **现象**：做 LED 子系统实验时把 `trigger` 从开机的 `[timer]` 改成 `heartbeat`/`none`，实验后**不知道该还原成什么值**
+- **根因**：sysfs 是可写的运行时接口，**改动立即生效且不持久化**（重启后由设备树/驱动恢复）。但**运行期间没有"撤销"功能**，只能靠事先记录
+- **解法**：
+  1. **动手前先存档**：`cat` 一遍要改的属性并留档（本次侥幸——日志里恰好有操作前的 `cat` 输出）
+  2. 权威来源是**设备树**里的默认值：
+     ```bash
+     ls /proc/device-tree/leds/*/
+     tr -d '\0' < /proc/device-tree/leds/<node>/linux,default-trigger
+     tr -d '\0' < /proc/device-tree/leds/<node>/default-state
+     ```
+  3. 最彻底的还原：`sudo reboot`
+- **教训**：**改系统状态前先备份"当前值"**（同一条规则适用于 `/proc/sys/*`、sysfs、内核参数、寄存器配置）
+- **关联**：`stage1-rk3566/docs/1.1-gpio-notes.md`
+
 ---
 
 ## 七、待填充区域
@@ -470,7 +517,7 @@
 
 | 来源 | 条数 |
 |------|------|
-| 【实测】（本项目亲历） | 14 |
+| 【实测】（本项目亲历） | 16 |
 | 【通用】（已知陷阱，未亲历） | 15 |
 
 > 💡 **启发式观察**：当一个坑被踩过两次，说明它不是"坑"而是"知识盲区"，应该把根因写进 `SKILL.md` 或阶段学习笔记，而不只是记在这里。
