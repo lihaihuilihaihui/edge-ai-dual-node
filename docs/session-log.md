@@ -751,3 +751,108 @@ mmcblk0: p1(4M uboot) p2(4M) p3(64M boot) p4(128M recovery) p5(32M)
 - ⬜ 下单：SG90 舵机 ×2 + 二轴云台 + 杜邦线 + 独立 5V 电源（**杜邦线会影响 1.1 实验 3 的验证方式**）
 
 **经验库累计**：14 条【实测】+ 15 条【通用】
+
+---
+
+## 2026-09-21 · 1.1 GPIO 与 LED（实验）✅ 结课
+
+### 实验全过程
+
+**① udev 规则解决 `/dev/gpiochip*` 权限**
+
+```
+SUBSYSTEM=="gpio", KERNEL=="gpiochip*", GROUP="gpio", MODE="0660"
+```
+
+- **首次失败**：MODE 生效（`600 → 660`），但**属组仍是 `root`**
+- **根因**：**`gpio` 组不存在** → udev **静默忽略** GROUP 参数
+  - 证据：`systemd-udevd: /etc/udev/rules.d/99-gpiochip.rules:1 Unknown group 'gpio', ignoring`
+- **解决**：`groupadd gpio` → `usermod -aG gpio lihaihui` → `udevadm control --reload-rules` → `udevadm trigger`
+- 结果：`crw-rw---- 1 root gpio 254, 3 /dev/gpiochip3` ✅ 免 sudo 可用
+- ⚠️ **`newgrp gpio` 只影响当前 shell**；VS Code 分屏新开的终端不继承（表现为 `gpioset: Permission denied`）→ 需重启 VS Code Server 才能永久生效
+- → **K-030**
+
+**② sysfs 点亮板载 RGB LED**
+
+```bash
+echo 1 | sudo tee /sys/class/leds/rgb-led-r/brightness
+```
+
+用户**答对关键问题**：为什么 LED 要 `sudo` 而 GPIO 不用 → **udev 只管 `/dev`，不管 `/sys`**（sysfs 权限由驱动创建时决定，无法用 udev 改）✅
+
+**③ ★ trigger 机制**
+
+```bash
+echo heartbeat | sudo tee /sys/class/leds/rgb-led-r/trigger
+```
+**LED 自己按心跳闪，而没有任何用户态程序在运行** ✅
+
+- `[方括号]` = **当前激活的触发器**
+- 支持的触发器：`none / timer / heartbeat / mmc0 / cpu0-3 / default-on / rfkill-*` 等
+
+**④ libgpiod 与"所有权"**
+
+```bash
+# A 终端占住
+gpioset --mode=wait gpiochip3 1=1
+# B 终端观察
+gpioinfo gpiochip3 | grep "line   1:"
+        line   1:  unnamed  "gpioset"  output  active-high [used]   ← ★
+# B 终端抢线
+gpioget gpiochip3 1
+gpioget: error reading GPIO values: Device or resource busy        ← ★ 所有权生效
+```
+
+- 所有权粒度 = **单条 line**（line 2 依然可申请）
+- ⚠️ `Ctrl+C` 强杀时**方向不重置**（退出后仍 `output`）
+
+**⑤ ★★ 电平传递验证（杜邦线）**
+
+- 接线：排针 **11**（输出）↔ 排针 **13**（输入）
+- 输出 1 → 读到 **1**；输出 0 → 读到 **0**（**稳定且相反**）✅
+- **完整链路被证明**：
+  ```
+  程序 → /dev/gpiochip3 → gpio 子系统 → pinctrl → 排针 11 →（杜邦线）→ 排针 13 → 另一程序
+  ```
+- **副产品**：中途拔线导致读数**随机跳变** → 意外验证了 **「稳定 = 有驱动源；跳变 = 悬空」** 这条 GPIO 输入经典判据
+
+### 答案 review（三处纠正）
+
+| 问题 | 用户答案 | 纠正 |
+|------|---------|------|
+| `trigger` 里方括号的含义 | "当前被调用的接口" | 应为「**当前激活的触发器**」 |
+| 为什么 line 1 被拒、line 2 却成功 | （答成了第 7 问） | **所有权粒度 = 单条 line** |
+| 所有权能否避免 K-029 的坑 | "要看 UART 是否正在使用" | **不能**——两者在**不同层**：所有权在 gpio 子系统，UART 占用在 **pinctrl 层**，互不知情 |
+
+**✅ 答得最好的**：udev 只管 `/dev` 不管 `/sys`——说明权限模型的认知已经打通。
+
+### 新经验
+
+- **K-030**：udev 规则的 `GROUP` 依赖组存在（不存在则静默忽略）+ `newgrp` 的作用域
+- **K-031**：改 sysfs 状态前必须先记录原始值（LED trigger 改坏不易还原）
+
+### 进度
+
+| 小节 | 状态 |
+|------|------|
+| 阶段 0 | ✅ 全部完成 |
+| 1.0 环境探测收尾 | ✅ 完成 |
+| **1.1 GPIO 与 LED** | ✅ **结课** |
+| 1.2 字符设备驱动 | ⬜ **下一个** |
+| 1.3 ~ 1.5 | ⬜ |
+
+### ⏭️ 下次起点：**1.2 字符设备驱动**（6 h，分 3 次）
+
+**已就绪**：
+- 编译环境：`/lib/modules/6.1.141/build` 存在 → **板卡上原生编译**
+- **不碰设备树**（规避"改设备树 → 重编内核 → 刷 boot 分区"的高风险链路）
+- 第一次目标：**最小可加载模块**（`insmod` 打印 hello / `rmmod` 打印 bye）
+
+**待办未清**：
+- ⬜ **LED `trigger` 还原**为开机默认（`[timer]` + `brightness=1`），或直接重启板子
+- ⬜ 每次开新终端需 `newgrp gpio`（或重启 VS Code Server 永久解决）
+- ⬜ `:%s/line/row/g` 练习（0.5 遗留）
+- ⬜ 排针 UART 电平实测（阶段 2 接线前必须做）
+- ⬜ 下单：SG90 舵机 ×2 + 二轴云台 + 独立 5V 电源
+
+**经验库累计**：16 条【实测】+ 15 条【通用】
