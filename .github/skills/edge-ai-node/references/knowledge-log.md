@@ -496,6 +496,61 @@
 - **教训**：**改系统状态前先备份"当前值"**（同一条规则适用于 `/proc/sys/*`、sysfs、内核参数、寄存器配置）
 - **关联**：`stage1-rk3566/docs/1.1-gpio-notes.md`
 
+### K-032 【实测】交叉编译的内核树不能搬到目标板上编模块——host 工具架构不匹配
+- **日期**：2026-09-27
+- **现象**：在 aarch64 板卡上编译内核模块失败：
+  ```
+  warning: the compiler differs from the one used to build the kernel
+  /bin/sh: 1: scripts/basic/fixdep: Exec format error
+  make[2]: *** [scripts/Makefile.build:250: ...] Error 126
+  ```
+- **根因**：`/usr/src/linux-headers-6.1.141/scripts/basic/fixdep` 是 **x86-64 二进制**
+  ```
+  file → ELF 64-bit LSB pie executable, x86-64, interpreter /lib64/ld-linux-x86-64.so.2
+  ```
+  **内核构建产物分两类**：
+
+  | 类型 | 运行在 | 架构 |
+  |------|--------|------|
+  | 目标代码（kernel / modules） | 目标板 | 目标架构（aarch64） |
+  | **host 工具**（`fixdep` / `conf` / `modpost`） | **构建机** | **构建机架构（x86_64）** |
+
+  内核在 x86 上交叉编译 → host 工具是 x86 的 → **拷到 aarch64 板卡执行不了**
+- **尝试就地重建 → 死锁**：
+  ```
+  make scripts → 需要 syncconfig → 需要 scripts/kconfig/conf → 它也是 x86 的 💀
+  ```
+  且 `make modules_prepare` 有**副作用**：删除了 `include/generated/autoconf.h`
+- **解法（推荐）**：**回到编内核的那台机器上编模块**
+  ```bash
+  # 在 x86 构建机上（用编内核的那棵树）
+  make -C <kernel-src> M=$PWD ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules
+  file xxx.ko            # 验证：ARM aarch64
+  scp xxx.ko <板卡>:/path/
+  ```
+  **这是标准嵌入式工作流**：构建机编译 → 目标板只负责运行/验证
+- **备选方案**：若坚持"让板卡自己能编"，必须在板卡上**重新构建一遍内核树**（`make modules_prepare`），耗时数小时 + 需数 GB 空间（板卡仅剩 6.3G）—— 通常不划算
+- **澄清一个常见误解**：**"板卡不能编译"是错的**——板卡能编普通程序（原生 gcc + 系统 libc 齐全，0.4 的 make-lab 就是在板卡上编的）。真正受限的是"**依赖外来内核构建树**"的东西
+- **类比**：把 Keil 工程拷到 STM32 上编译——工程里的 `armcc.exe` 是 Windows 程序，跑不了
+- **关联**：`docs/session-log.md` 2026-09-27；K-009（模块与内核版本强绑定）
+
+### K-033 【实测】`loading out-of-tree module taints kernel` 是正常提示，不是错误
+- **日期**：2026-09-27
+- **现象**：`insmod` 自编模块后，`dmesg` 出现：
+  ```
+  edge_ai_evt: loading out-of-tree module taints kernel.
+  edge_ai_evt init
+  ```
+- **根因**：**taint（污染）是内核的标记机制**——记录"当前内核加载过非官方 / 非 GPL 代码"
+  - `out-of-tree module` = 模块不在内核源码树内（外部模块）
+  - **影响**：内核崩溃报告（oops/panic）**不会被上游/发行版官方受理**——无法确定问题是否由第三方代码引起
+  - 若 `MODULE_LICENSE` **不是 GPL 兼容**，会额外多一条 `module license 'xxx' taints kernel`
+- **解法**：**无需处理**（预期行为）
+  - 规范做法：写 `MODULE_LICENSE("GPL")`，避免额外的专有 license taint
+  - 排查问题时：先 `rmmod` 自己的模块，看问题是否仍复现（排除干扰）
+- **验证**：`cat /proc/sys/kernel/tainted` 返回非 0（各 bit 标记不同污染原因）
+- **关联**：`docs/session-log.md` 2026-09-27；`stage1-rk3566/drivers/edge_ai_evt/`
+
 ---
 
 ## 七、待填充区域
@@ -517,7 +572,7 @@
 
 | 来源 | 条数 |
 |------|------|
-| 【实测】（本项目亲历） | 16 |
+| 【实测】（本项目亲历） | 18 |
 | 【通用】（已知陷阱，未亲历） | 15 |
 
 > 💡 **启发式观察**：当一个坑被踩过两次，说明它不是"坑"而是"知识盲区"，应该把根因写进 `SKILL.md` 或阶段学习笔记，而不只是记在这里。
