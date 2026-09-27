@@ -132,14 +132,17 @@ gpiochip0 [gpio0] 32 lines ... gpiochip4 [gpio4] 32 lines   （5 个 bank，各 
 2. **规避"改设备树 → 重编内核 → 烧录"的高风险链路**（烧错可能变砖、周期长）
 3. 设备树的作用是"描述硬件并匹配 `platform_driver`"——留到真正需要时再学
 
-> 📌 **编译方式：板卡上原生编译**（`/lib/modules/6.1.141/build` 存在，已实测 ✅），不需要交叉编译。
+> 📌 **编译方式：在 x86 虚拟机上交叉编译**（⚠️ 板卡上原生编译**不可行** → 见 `docs/1.2-driver-notes.md` §零 / 知识库 K-032）。
+> 板卡 `/lib/modules/6.1.141/build` 指向的内核树里，`fixdep`/`conf`/`modpost` 等**主机工具是 x86-64 二进制**（内核在 x86 上交叉编译出来的），aarch64 板卡无法执行 → `fixdep: Exec format error`。
+> 正确做法（标准嵌入式工作流）：**在与编译内核同一台机器、同一棵源码树上编模块**，即虚拟机的 `~/tspi_sdk/kernel-6.1/`。
+> 现已封装为一键脚本：`module-deploy.sh edge_ai_evt`（rsync 拉源码 → 交叉编译 → scp 回传）。
 
 **分 3 次**：
-1. 最小可加载模块（`insmod` 打印 hello / `rmmod` 打印 bye）
-2. 加 `file_operations` + 自动创建 `/dev/edge_ai0`
-3. 实现 ioctl 控制 + read 读事件队列 + 用户态测试程序
+1. ✅ 最小可加载模块（`insmod` 打印 hello / `rmmod` 打印 bye）—— 2026-09-27
+2. ✅ 加 `file_operations` + 自动创建 `/dev/edge_ai0` —— 2026-09-27
+3. ⬜ 实现 ioctl 控制 + read 读事件队列 + 用户态测试程序
 
-**验收**：`insmod edge_ai_evt.ko` 后 `/dev/edge_ai0` 自动出现；用户态能 ioctl 配置 + read 取数；`rmmod` 干净卸载
+**验收**：`insmod edge_ai_evt.ko` 后 `/dev/edge_ai0` 自动出现 ✅；用户态能 ioctl 配置 + read 取数 ⬜；`rmmod` 干净卸载 ✅
 
 **对应 FR**：FR-28
 
@@ -291,18 +294,29 @@ graph TB
 |------|------|------|
 | 1.0 环境探测收尾 | ✅ **完成** | 2026-09-20 |
 | 1.1 GPIO 与 LED | ✅ **结课**（笔记：`docs/1.1-gpio-notes.md`） | 2026-09-21 |
-| 1.2 字符设备驱动 | 🟡 **进行中**（第 1 次 ✅ 最小模块跑通；笔记：`docs/1.2-driver-notes.md`） | 2026-09-27 |
+| 1.2 字符设备驱动 | 🟡 **进行中**（第 1、2 次 ✅；笔记：`docs/1.2-driver-notes.md`） | 2026-09-27 |
 | 1.3 摄像头 V4L2 | ⬜ 未开始 | |
 | 1.4 串口与协议 | ⬜ 未开始 | |
 | 1.5 应用工程化 | ⬜ 未开始 | |
 
-### ⏭️ 下次起点：1.2 第 2 次 —— `file_operations` + 自动创建设备节点
+### ⏭️ 下次起点：1.2 第 3 次（最后一次）—— `.read` + `.unlocked_ioctl`
 
-**目标**：`insmod` 后 **`/dev/edge_ai0` 自动出现**（不手动 `mknod`），用户态能 `open` 它。
+> ⚡ **开工第一件事：按 4 条改进意见调整代码**（用户明确要求提醒）
+>
+> | # | 改进项 |
+> |---|--------|
+> | 1 | `printk` 宏与字符串之间加空格：`KERN_INFO "…"` |
+> | 2 | 日志加模块名前缀：`"edge_ai_evt: …"` |
+> | 3 | ⭐ 改用 `pr_fmt` + `pr_info`/`pr_err`（**`pr_fmt` 必须写在所有 `#include` 之前**） |
+> | 4 | `MODULE_VERSION` 升到 `"0.3"` |
+>
+> 详见 `docs/1.2-driver-notes.md` §8.1 与 `docs/session-log.md` 2026-09-27（下半场）
 
-**环境方案已确定**（见 `docs/1.2-driver-notes.md` §零）：
-- 在 **x86 虚拟机的 `~/tspi_sdk/kernel-6.1/`** 交叉编译
-- 产物 `scp` 到板卡 `insmod`
+**目标**：实现 `.read` + `.unlocked_ioctl`，让 `cat /dev/edge_ai0` 能读出数据（闭环今天 `Invalid argument` 的问题）。
+
+**关键 API**：⭐ `copy_to_user()`、`kmalloc`/`kfree`、（可选）等待队列
+
+**构建命令**：`module-deploy.sh edge_ai_evt`
 
 按五步法走：1. 我讲原理 → 2. 我定目标 → 3. 我给思路 → 4. **你动手** → 5. 我 review
 

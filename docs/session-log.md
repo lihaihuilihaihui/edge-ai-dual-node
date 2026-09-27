@@ -954,3 +954,97 @@ make scripts → 需要 syncconfig → 需要 scripts/kconfig/conf → 它也是
 目标：`insmod` 后 **`/dev/edge_ai0` 自动出现**，用户态能 `open` 它。
 
 **经验库累计**：18 条【实测】+ 15 条【通用】
+
+---
+
+## 2026-09-27（下半场）· 1.2 第 2 次完成 ✅ `file_operations` + 自动创建设备节点
+
+### 一、构建/部署工具链建立（基础设施，以后一直用）
+
+**问题**：虚拟机 ↔ 板卡来回 `scp` + 手打长命令太繁琐
+
+**解决（三件套）**：
+
+| # | 做什么 | 效果 |
+|---|--------|------|
+| 1 | **SSH 免密**：虚拟机 `ssh-copy-id lihaihui@lckfb` | 不用每次输密码 |
+| 2 | **SSH 别名**：虚拟机 `~/.ssh/config` 定义 `Host board`（`HostName lckfb`） | 命令里写 `board` 而不是 IP；IP 变了只改一处 |
+| 3 | **一键脚本** `~/bin/module-deploy.sh <模块名>` | **rsync 同步源码 → 交叉编译 → 回传 .ko** |
+
+**脚本关键点**：
+- 用 `rsync -av --delete` **删除目标端多余文件**（实测有效：清掉了虚拟机上残留的 `.o`/`modules.order`，避免旧产物干扰）
+- 配置区与逻辑分离（换模块只传参，换板卡只改 `BOARD_BASE`）
+
+**用法**：`module-deploy.sh edge_ai_evt`
+
+**环境事实**：
+- 板卡主机名 `lckfb`，由虚拟机 `/etc/hosts` 解析（`192.168.31.151 lckfb.localdomain`）
+- 板卡镜像为**最小化镜像**（登录时提示 `This system has been minimized...`）→ 缺命令属正常，缺什么装什么（已装 `file`、`rsync`）
+- `lckfb.local`（mDNS）**不可用**——虚拟机在 NAT 网段、板卡在 LAN，**不同广播域**；要用 mDNS 须先把 VMware 改桥接
+
+### 二、1.2 第 2 次：核心成果
+
+**新增**：`file_operations` + `register_chrdev` + `class_create` + `device_create`
+
+| 验证项 | 结果 |
+|--------|------|
+| 设备节点 | ✅ `/dev/edge_ai0` **自动出现**（无需 `mknod`） |
+| 主设备号 | **510**（内核动态分配，从高位倒着找） |
+| 权限 | `root:root`（**udev 默认规则**给的 —— 呼应 1.1） |
+| 设备号在 sysfs 的落地 | `cat /sys/class/edge_ai/edge_ai0/dev` → **`510:0`** |
+| class 软链接 | `/sys/class/edge_ai/edge_ai0` → `../../devices/virtual/edge_ai/edge_ai0`（parent 传 NULL → 归 virtual 总线） |
+| **注释掉 class/device** | ✅ `/dev/edge_ai0` 不出现，但 `/proc/devices` 仍有驱动 → **证明"设备号 ≠ 设备节点"** |
+| **引用计数保护** | ✅ 终端 A 挂着 `open`，终端 B `rmmod` → **`Module edge_ai_evt is in use`** |
+| `open`/`release` 回调 | ✅ `dmesg` 可见 |
+
+**代码 review 结论**：错误处理**全部正确** ✅
+（`register_chrdev` 用 `< 0` 判断、`IS_ERR`/`PTR_ERR` 用法正确、**每级失败都回滚已申请的资源**、`exit` 严格逆序释放、`.owner = THIS_MODULE` 到位）
+
+### 三、新知识点
+
+**① `EACCES` 与 `EINVAL` 来自不同的层** → **K-034**
+
+| 错误 | 场景 | 来自哪层 | 说明 |
+|------|------|---------|------|
+| `Permission denied`（`EACCES`） | 普通用户 `open()` | **VFS 权限检查** | 设备节点权限拒绝，**驱动代码根本没执行** |
+| `Invalid argument`（`EINVAL`） | root `read()` | **VFS 调用 fops** | 权限过了，但 `.read` 是 `NULL` → 返回 `-EINVAL` |
+
+**排错指引**：见 `EACCES` 查权限/udev 规则；见 `EINVAL` 查 fops 实现了哪些回调。
+
+**② 为什么 `cat /dev/edge_ai0` 报 `Invalid argument`**
+
+`cat` = `open` + 循环 `read` + `close`。当前 fops 只有 `.open`/`.release`，**`.read` 是 `NULL`** → VFS 返回 `-EINVAL` → `cat` 打印错误并退出。
+（这也解释了为什么"引用计数实验"里 `cat` 挂不住——它立刻退出了；改用 Python 只 `open` 不 `read` 才挂住。）
+
+### 四、⏭️ 下次起点：1.2 第 3 次（最后一次）—— `.read` + `.ioctl`
+
+> ⚡ **开工前必须先按下面的改进意见调整代码**（用户明确要求提醒）
+
+| # | 改进项 | 具体做法 |
+|---|--------|---------|
+| 1 | **`printk` 宏与字符串之间加空格** | `printk(KERN_INFO "…")`（现在写成了 `KERN_INFO"…"`，能编译但可读性差） |
+| 2 | **日志加模块名前缀** | `"edge_ai_evt: device opened\n"` |
+| 3 | ⭐ **改用 `pr_fmt` + `pr_info`/`pr_err`**（现代内核标准写法） | **`#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt` 必须写在所有 `#include` 之前！**（写在后面会失效） |
+| 4 | **`MODULE_VERSION` 升到 `0.3`** | 功能变化时同步版本号 |
+
+**第 3 次要实现**：
+
+| # | 内容 | 核心 API ⭐ |
+|---|------|-----------|
+| 1 | `.read` 回调 | **`copy_to_user()`** ← **跨用户态/内核态边界，本单元最重要的概念** |
+| 2 | 内核内部数据缓冲区 | `kmalloc` / `kfree` |
+| 3 | `.unlocked_ioctl` | 自定义命令（配置参数 / 清空队列） |
+| 4 | （可选）等待队列 | 无数据时阻塞 `read`，而不是立刻返回 0 |
+
+**做完第 3 次，`edge_ai_evt` 就是功能完整的教学驱动**（SPEC FR-28 达成），**阶段 1.2 全部结课**。
+
+### 进度
+
+| 小节 | 状态 |
+|------|------|
+| 1.0 环境探测 | ✅ |
+| 1.1 GPIO 与 LED | ✅ 结课 |
+| **1.2 字符设备驱动** | 🟡 **第 1、2 次完成**，第 3 次待做 |
+| 1.3 ~ 1.5 | ⬜ |
+
+**经验库累计**：19 条【实测】+ 15 条【通用】
