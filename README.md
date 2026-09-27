@@ -38,13 +38,14 @@ ESP32 用 PIR 常驻感知（μA 级功耗）→ 有人接近则唤醒 RK3566 �
 
 | 阶段 | 内容 | 状态 |
 |------|------|------|
-| 0 | 工具链补课：git / 交叉编译 / 工程化 | 🟡 进行中 |
-| 1 | RK3566 Linux 底层：GPIO → 字符驱动 → UART → 多线程应用 | ⬜ 未开始 |
+| 0 | 工具链补课：git / 交叉编译 / Makefile / vim / 推送 GitHub | ✅ **完成**（2026-09-19） |
+| 1 | RK3566 Linux 底层：GPIO → 字符驱动 → V4L2 → UART → 多线程应用 | 🟡 **进行中**（1.0 环境探测 ✅ / 1.1 GPIO 与 LED ✅ / 1.2 字符设备驱动 ⏳） |
 | 2 | ESP32 采集 + 自定义 UART 协议 + 双芯双向通信 | ⬜ 未开始 |
 | 3 | 边缘 AI：RKNN 模型转换 → 摄像头目标检测 → AI 驱动执行 | ⬜ 未开始 |
 | 4 | 作品收尾：文档 / 演示 / 博客 / 简历 | ⬜ 未开始 |
 
-详细计划见 [`docs/PLAN.md`](docs/PLAN.md)；具体功能/指标/技术选型见 [`docs/SPEC.md`](docs/SPEC.md)。
+详细计划见 [`docs/PLAN.md`](docs/PLAN.md)；具体功能/指标/技术选型见 [`docs/SPEC.md`](docs/SPEC.md)；
+各阶段学习地图见 [`stage0-toolchain/LEARNING-MAP.md`](stage0-toolchain/LEARNING-MAP.md) 与 [`stage1-rk3566/LEARNING-MAP.md`](stage1-rk3566/LEARNING-MAP.md)。
 
 ## 文档导览
 

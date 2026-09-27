@@ -45,18 +45,24 @@ ESP32(采集/控制) ──UART(自定义帧协议,CRC)──► RK3566(驱动+�
 ```
 
 ## 分阶段里程碑（适配碎片时间）
-### 阶段 0：工具链补课（1-2 周碎片）
-- [ ] git 安装/入门（本机已装）：init/commit/branch/remote，GitHub 私有库
-- [ ] 项目骨架 + README（已完成 2026-09-09）
-- [ ] 终端/vim 基础操作（够用即可）
-- [ ] gcc/make/aarch64 交叉编译 Hello 程序跑通
-- [ ] 建立 TF 卡数据目录约定
+### 阶段 0：工具链补课（1-2 周碎片）—— ✅ 已完成 2026-09-19
+- [x] git 安装/入门（本机已装）：init/commit/branch/remote，GitHub 私有库
+- [x] 项目骨架 + README（已完成 2026-09-09）
+- [x] 终端/vim 基础操作（够用即可）
+- [x] gcc/make/aarch64 交叉编译 Hello 程序跑通
+- [x] 建立 TF 卡数据目录约定
 
-### 阶段 1：RK3566 Linux 底层（4-6 周碎片）
-- [ ] 1.1 板载 GPIO/LED/按键：libgpiod 点亮读取（MCU 思维平移）
-- [ ] 1.2 首个字符设备驱动 + 设备树节点（基于自编内核），ioctl 控制外设
-- [ ] 1.3 UART 串口 C 编程（ttyS 设备节点）
+> 📌 **实际执行以 [`stage0-toolchain/LEARNING-MAP.md`](../stage0-toolchain/LEARNING-MAP.md) 为准**
+> （小节编号与顺序经过调整：0.1 环境权限 → 0.2 git → 0.6 推送 → 0.4 Makefile → 0.3 交叉编译 → 0.5 vim）
+
+### 阶段 1：RK3566 Linux 底层（4-6 周碎片）—— 🟡 进行中
+- [x] 1.1 板载 GPIO/LED/按键：libgpiod 点亮读取（MCU 思维平移）✅ 2026-09-21
+- [ ] 1.2 首个字符设备驱动（**不碰设备树**，规避烧内核风险），ioctl 控制外设 —— 🟡 第 1 次完成（最小模块跑通）
+- [ ] 1.3 UART 串口 C 编程（ttyS3 设备节点）
 - [ ] 1.4 用户态应用：多线程/进程、IPC、日志、Makefile 工程化
+
+> 📌 **实际执行以 [`stage1-rk3566/LEARNING-MAP.md`](../stage1-rk3566/LEARNING-MAP.md) 为准**
+> （重排为 6 节：1.0 环境探测 → 1.1 GPIO/LED → 1.2 字符驱动 → 1.3 摄像头 V4L2 → 1.4 串口协议 → 1.5 应用工程化）
 
 ### 阶段 2：ESP32 前端 + 双芯通信（3-4 周碎片）
 - [ ] 2.1 ESP32 环境（ESP-IDF），采集 DHT11 温湿度/超声波

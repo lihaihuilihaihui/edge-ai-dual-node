@@ -856,3 +856,101 @@ gpioget: error reading GPIO values: Device or resource busy        ← ★ 所�
 - ⬜ 下单：SG90 舵机 ×2 + 二轴云台 + 独立 5V 电源
 
 **经验库累计**：16 条【实测】+ 15 条【通用】
+
+---
+
+## 2026-09-27 · 1.2 字符设备驱动（第 1 次）✅ 最小内核模块跑通
+
+### 🔥 途中撞上重大障碍：交叉编译的内核树不能在目标板上编模块
+
+**现象**：板卡上 `make` 失败
+```
+warning: the compiler differs from the one used to build the kernel
+  The kernel was built by: aarch64-linux-gnu-gcc ...
+  You are using:           gcc ...
+/bin/sh: 1: scripts/basic/fixdep: Exec format error
+make[2]: *** Error 126
+```
+
+**根因**：`/usr/src/linux-headers-6.1.141/scripts/basic/fixdep` 是 **x86-64 二进制**
+```
+file → ELF 64-bit LSB pie executable, x86-64, interpreter /lib64/ld-linux-x86-64.so.2
+```
+
+- 内核构建产物分两类：**目标代码**（aarch64）+ **host 工具**（**构建机架构**）
+- 内核在 x86 上交叉编译 → host 工具（`fixdep`/`conf`/`modpost`）是 x86 的
+- 把它们拷到 aarch64 板卡 → **跑不了**
+
+**尝试就地重建 → 死锁**：
+```
+make scripts → 需要 syncconfig → 需要 scripts/kconfig/conf → 它也是 x86 的 💀
+```
+且 `make modules_prepare` 有**副作用**：删除了 `include/generated/autoconf.h`
+
+**✅ 正解：回到"编内核的那台机器"上编模块**（标准嵌入式工作流）
+
+**用户的重要疑问 + 解答**：
+
+> 「我的板卡自己无法编译代码？它自己不是有 Ubuntu 系统吗？」
+
+**答**：不是"板卡不能编译"——**板卡能编普通程序**（0.4 的 make-lab 就是板卡上编的 ✅）。
+真正受限的是"**依赖外来内核构建树**"的东西：编译模块需要 host 工具，而那套是 x86 的。
+→ **类比**：把 Keil 工程拷到 STM32 上编译（工程里有 `armcc.exe` 这种 Windows 程序）
+→ 详见 **K-032**
+
+### 完整链路走通 ✅
+
+| 步骤 | 在哪 | 命令 / 结果 |
+|------|------|------------|
+| 1 | 板卡 | 写 `edge_ai_evt.c` + `Makefile` |
+| 2 | 虚拟机 | `scp -r lihaihui@192.168.31.151:~/.../edge_ai_evt ~/` |
+| 3 | 虚拟机 | `make -C ~/tspi_sdk/kernel-6.1 M=$PWD ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules` |
+| 4 | 虚拟机 | `file edge_ai_evt.ko` → **ELF 64-bit LSB relocatable, ARM aarch64** ✅ |
+| 5 | 虚拟机 | `scp edge_ai_evt.ko lihaihui@192.168.31.151:~/.../edge_ai_evt/` |
+| 6 | 板卡 | `sudo insmod edge_ai_evt.ko` → `lsmod` 可见 ✅ |
+| 7 | 板卡 | `dmesg` → `edge_ai_evt init` ✅ |
+| 8 | 板卡 | `sudo rmmod edge_ai_evt` → `dmesg` → `edge_ai_evt exit` ✅ |
+
+**关键**：虚拟机上**没有** `warning: the compiler differs`——因为在编内核的那棵树、那台机器上编 ✅
+
+### 关键环境事实（已记录）
+
+| 项 | 值 |
+|---|---|
+| **内核源码树（x86）** | **`~/tspi_sdk/kernel-6.1/`**（含 `.config`、`Module.symvers`、`vmlinux`、host 工具） |
+| 同目录还有 | `~/tspi_sdk/u-boot/`、`~/tspi_sdk/output/recovery-kernel/` |
+| **编译命令** | `make -C ~/tspi_sdk/kernel-6.1 M=$PWD ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules` |
+| **传输通路** | 虚拟机 ↔ 板卡 **双向 scp**（虚拟机可拉可推）✅ |
+
+### 学到的三件事
+
+1. **`taints kernel` 是正常提示，不是错误** → **K-033**
+   - `loading out-of-tree module taints kernel` = 内核标记"加载过非官方代码"
+   - 影响：内核崩溃报告**不被官方受理**（无法确定是否你的模块引起）
+   - `MODULE_LICENSE("GPL")` 避免了"专有 license"的额外 taint
+2. **`.o.d` 文件 = 0.4 学的 `-MMD` 的产物**（知识串联 ✅）
+   - kbuild 用 **`fixdep`** 生成 `.o.d`（列出 `.c` 依赖的所有 `.h`）
+   - `.o.cmd` 记录编译命令（kbuild 判断是否重编的依据）
+   - **内核构建系统做的事，和 0.4 手写 Makefile 本质相同**，只是规模大得多
+3. **编译产物必须验证架构**：`file xxx.ko` → `ARM aarch64`（0.3 的习惯在这里复用）
+
+### 待改进
+
+- ⬜ `printk` 未加日志级别（建议 `printk(KERN_INFO "edge_ai_evt: ...\n")`）
+- ✅ README 阶段进度表已更新（用户提醒得对）
+- ⬜ 可考虑在虚拟机上配 GitHub SSH key（以后 git 同步比 scp 优雅）
+
+### 进度
+
+| 小节 | 状态 |
+|------|------|
+| 1.0 环境探测 | ✅ |
+| 1.1 GPIO 与 LED | ✅ 结课 |
+| **1.2 字符设备驱动** | 🟡 **第 1 次完成**（最小模块跑通），第 2/3 次待做 |
+| 1.3 ~ 1.5 | ⬜ |
+
+### ⏭️ 下次起点：**1.2 第 2 次 —— `file_operations` + 自动创建设备节点**
+
+目标：`insmod` 后 **`/dev/edge_ai0` 自动出现**，用户态能 `open` 它。
+
+**经验库累计**：18 条【实测】+ 15 条【通用】
