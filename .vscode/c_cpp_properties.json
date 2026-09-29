@@ -1,0 +1,25 @@
+{
+    "version": 4,
+    "configurations": [
+        {
+            "name": "Kernel Module",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/lib/modules/6.1.141/build/include",
+                "/lib/modules/6.1.141/build/include/uapi",
+                "/lib/modules/6.1.141/build/include/generated",
+                "/lib/modules/6.1.141/build/arch/arm64/include",
+                "/lib/modules/6.1.141/build/arch/arm64/include/uapi",
+                "/lib/modules/6.1.141/build/arch/arm64/include/generated"
+            ],
+            "defines": [
+                "__KERNEL__",
+                "MODULE",
+                "KBUILD_MODNAME=\"edge_ai_evt\""
+            ],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "gnu11",
+            "intelliSenseMode": "linux-gcc-arm64"
+        }
+    ]
+}

@@ -46,8 +46,9 @@ managed_components/
 *.key
 *.pem
 
-# VS Code
-.vscode/
+# VS Code（保留 IntelliSense 配置：它记录了内核模块所需的 defines，见 K-035）
+.vscode/*
+!.vscode/c_cpp_properties.json
 *.code-workspace
 
 # 临时/测试产物
@@ -61,6 +62,10 @@ tmp/
 # 阶段0 练习项目的产物（源码要提交，产物不提交）
 stage0-toolchain/practice/**/app
 stage0-toolchain/practice/**/*.d
+
+# 驱动目录下用户态测试程序的编译产物（源码 .c 要提交）
+stage1-rk3566/drivers/**/test_*
+!stage1-rk3566/drivers/**/test_*.c
 
 # 系统备份镜像
 *.img.gz
