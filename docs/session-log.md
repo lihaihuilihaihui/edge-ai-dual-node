@@ -1038,13 +1038,274 @@ make scripts → 需要 syncconfig → 需要 scripts/kconfig/conf → 它也是
 
 **做完第 3 次，`edge_ai_evt` 就是功能完整的教学驱动**（SPEC FR-28 达成），**阶段 1.2 全部结课**。
 
+---
+
+## 2026-09-28 · 1.2 第 3 次 —— `.read` + `copy_to_user` ✅
+
+### 一、先修正了昨天笔记里的一个错误（我的锅）
+
+昨天笔记把设备注册写成 `alloc_chrdev_region` + `cdev_init`/`cdev_add`，**实际用的是 `register_chrdev`**（一步到位的老接口）。已修正 `1.2-driver-notes.md` §7.1b，并补了新旧接口对比表。
+
+**顺带一个坑点**：`register_chrdev` **成功返回主设备号本身（正数）**，不是 0 → 必须 `if (major < 0)`，不能 `if (!major)`（主设备号 0 是合法值）→ **K-039**
+
+### 二、开工前按 4 条改进意见改了代码
+
+| # | 改进项 | 结果 |
+|---|--------|------|
+| 1 | `printk` 宏与字符串间加空格 | ✅ |
+| 2 | 日志加模块名前缀 | ✅ |
+| 3 | ⭐ 改用 `pr_fmt` + `pr_info`/`pr_err` | ✅ |
+| 4 | `MODULE_VERSION` → `0.3` | ✅ |
+
+**`pr_fmt` 机制（查 `printk.h` 实证）**：
+
+```c
+/* printk.h:346 */  #ifndef pr_fmt
+                   #define pr_fmt(fmt) fmt
+                   #endif
+/* printk.h:529 */  #define pr_info(fmt, ...) printk(KERN_INFO pr_fmt(fmt), ##__VA_ARGS__)
+```
+
+`pr_info` 只是**薄封装**，把 `pr_fmt(fmt)` 塞进 `printk`。展开链：
+`pr_info("x")` → `printk(KERN_INFO pr_fmt("x"))` → `printk(KERN_INFO KBUILD_MODNAME ": " "x")` → 字符串自动拼接。
+
+**为什么必须写在所有 `#include` 之前**：`printk.h` 用 `#ifndef pr_fmt` 做兜底。写在前面 → 内核不定义默认版，干净；写在后面 → 触发 `"pr_fmt" redefined` 警告，且头文件里已展开过的 `pr_*` 调用用的是旧前缀。
+
+**dmesg 实测**：
+
+```
+[ 2926.560635] edge_ai_evt: loading out-of-tree module taints kernel.   ← 无前缀（内核打的）
+[ 2926.561276] edge_ai_evt: registered, major=510
+[ 2926.561604] edge_ai_evt: module loaded
+```
+
+> 第一行**没有**前缀恰好反证了前缀确实来自我们的 `pr_info`。
+
+### 三、IDE 红线排查（→ K-035）
+
+**现象**：交叉编译完全成功、模块运行正常，但 VS Code 里 8 个 `pr_info`/`pr_err` 全飘红，错误是 **`应输入 ")"`（语法错）**，**不是**"未定义标识符"。
+
+**推理链**：
+
+| 报什么 | 说明 |
+|---|---|
+| `identifier "pr_info" is undefined` | 找不到 `printk.h` → includePath 没配好 |
+| **`应输入 ")"`** | 头文件找到了、宏也展开了，只是展开结果里有**未定义的宏** |
+
+**根因**：`KBUILD_MODNAME` 未定义 → 展开成 `printk("\001" "6" KBUILD_MODNAME ": " "x")` → 裸标识符夹在字符串字面量中间 → 语法错。
+`KBUILD_MODNAME` **不在任何头文件里定义**（`printk.h` 只在注释里出现过），它是 **kbuild 用 `-D` 注入的**。
+
+**解法**：`.vscode/c_cpp_properties.json` 的 `defines` 加 `"KBUILD_MODNAME=\"edge_ai_evt\""`（值只是占位，真实值永远由 kbuild 给）。
+
+> **MCU 类比**：等价于 Keil 的 `Options → C/C++ → Define`——Keil 认识，VSCode 插件不认识，就飘红。
+
+### 四、`.read`：三个动手前的问题（含答案）
+
+| # | 问题 | 答案 |
+|---|------|------|
+| 1 | 缓冲区空了返回 `0` 还是 `-EAGAIN`？ | `0` = EOF（以后也没有了）→ `cat` 正常退出；`-EAGAIN` = **暂时**没数据、以后可能有（非阻塞模式）→ **不是错误**。本设备是固定消息 → `return 0` 正确 |
+| 2 | `copy_to_user` 返回 `5` 是什么意思？ | 是**"还剩 5 字节没搬完"**，不是错误码 → `if (ret) return -EFAULT;`。❌ 直接 `return ret` 会让调用者以为"读到了 5 字节"，**结论完全反了** |
+| 3 | `GFP_KERNEL` 是什么？ | **GFP = Get Free Pages**，是 `kmalloc` 的**标志位**，不是地址。含义是"**允许睡眠**"。中断上下文**绝对不能睡眠**（处理程序不属于任何任务，睡了没人唤醒）→ 中断里只能用 `GFP_ATOMIC` |
+
+> **MCU 类比（Q3）**：`GFP_KERNEL` ≈ 阻塞式发送（可等）；`GFP_ATOMIC` ≈ ISR 里只能读寄存器不能等。**ISR 里不能阻塞 —— MCU 和 Linux 完全一致。**
+
+### 五、⭐ 用户自己发现的改进：用 `*ppos` 而不是全局 `kpos`
+
+计划里给的是"全局 `kpos` 记录读到哪了"，用户改用 `*ppos`（`struct file::f_pos`）。**这个改动更正确**：
+
+| 方案 | 进程 A `cat` 读完后，进程 B 再 open | 结果 |
+|---|---|---|
+| 全局 `kpos` | `kpos` 已 == `klen` | B **读到空** ❌ |
+| **`*ppos`** | B 的 `f_pos` 从 **0** 开始 | B **能重新读到全文** ✅ |
+
+**原因**：`struct file` 是每次 `open` 创建的，所以 `f_pos` **每 fd 独立**。内核里所有正规驱动（`/proc`、sysfs）都这么做。
+
+**实测证据**：
+
+```bash
+sudo cat /dev/edge_ai0        # → Hello from edge_ai_evt module!
+sudo cat /dev/edge_ai0        # → 又读到全文（若用全局 kpos 这里会是空）
+sudo head -c 5 /dev/edge_ai0  # → Hello
+```
+
+### 六、code review
+
+✅ **错误处理全部正确**：`if (count > klen - pos)` 截断（`pos < klen` 保证不下溢）、失败时不推进 `*ppos`、`kmalloc` 失败回滚链完整、`kfree` + 置 `NULL`。
+
+⚠️ **清理**：`kpos` 改用 `*ppos` 后成了**死变量**，已删除（换方案后要清残留）。
+
+**关于 `exit` 顺序**：用户把 `kfree` 放在最后（先断对外入口，后放内部数据）。这是**主流做法**，安全性依据是 **`rmmod` 先检查引用计数**——非 0 直接失败，所以 `exit` 执行时保证无用户。
+
+---
+
+## 2026-09-29 · 1.2 第 4 次 —— `.write` + `.unlocked_ioctl` ✅ **1.2 结课**
+
+### 一、原理：为什么还需要 ioctl
+
+`read`/`write` 只能传**字节流**，但设备需要**控制动作**（清空缓冲区、设参数、查状态）。`ioctl` 是"**带外命令**"的通用通道。
+
+> **MCU 类比**：串口既有 `HAL_UART_Transmit()` 传数据，也有 `HAL_UART_Init()` 做配置——`ioctl` 就是 Linux 给所有设备提供的**通用配置入口**。
+
+**三种回调**：`.ioctl`（已废弃，持大内核锁）→ **`.unlocked_ioctl`（用这个）** → `.compat_ioctl`（32 位程序跑在 64 位内核时的转换）
+
+### 二、⭐ 命令号为什么必须是"魔数"
+
+不能写 `cmd = 1`。`cmd` 是个 `unsigned int`，里面塞了 **4 个字段**：
+
+```
+ 31   30 29 ............ 16 15 14 ............ 8 7 ....... 0
+┌─────┬───────────────────┬────────┬────────────────┬──────────┐
+│ 方向 │      size         │  type  │                │   nr     │
+│(2位)│     (14位)        │ (8位)  │                │  (8位)   │
+└─────┴───────────────────┴────────┴────────────────┴──────────┘
+```
+
+**为什么需要 type（魔术字）**：所有驱动的 `ioctl` **共用同一个系统调用入口**。驱动 A 用 `cmd=1` 表示"清空设备"、驱动 B 也用 `cmd=1` 表示"格式化硬盘"，用户程序**传错 fd** 就是灾难。魔术字隔离开这个空间。
+
+**size 字段的意义**：让内核能校验 32/64 位兼容性 → 这也正是 **`compat_ioctl` 存在的原因**（32 位用户态的指针是 4 字节）。
+
+### 三、工程结构：拆出共享头文件
+
+```
+drivers/edge_ai_evt/
+├── edge_ai_evt.h      ← 契约：命令号 + 结构体 + 常量（内核态【与】用户态共用）
+├── edge_ai_evt.c
+├── test_edge_ai.c     ← 用户态测试程序（自写自编）
+├── Makefile
+└── README.md
+```
+
+`#ifdef __KERNEL__` 分支切 `<linux/ioctl.h>` / `<sys/ioctl.h>`（两处 `_IO*` 宏定义**兼容**）。
+
+**为什么必须共享**：命令号是**内核与用户态的契约（ABI）**；两边各写一份 → 改了一边忘了另一边 → 用户程序发"过时"命令号 → 行为错乱且极难排查。
+
+### 四、三个命令
+
+| 命令 | 类型 | `arg` 语义 |
+|---|---|---|
+| `EDGE_AI_IOC_CLEAR` | `_IO` | 无参（`klen = 0`） |
+| `EDGE_AI_IOC_PUT` | `_IOW` | 指向 `struct edge_ai_put_arg` 的用户指针 |
+| `EDGE_AI_IOC_LEN` | `_IOR` | 指向 `int` 的用户指针 |
+
+### 五、⚠️ `PUT` 的两次迭代（本次最有价值的教训 → K-037）
+
+**v1（有"运气型 bug"）**：
+
+```c
+char user_buf[BUF_SIZE];
+copy_from_user(user_buf, (char __user *)arg, BUF_SIZE);   /* 无条件拷 256 字节 */
+```
+
+用户传的是 23 字节的字符串，驱动却读 256 字节。**这次没崩是运气**（字符串在 `.rodata` 段，后面同页内有数据）。若字符串正好在**页尾** → 后面是未映射页 → `-EFAULT`，而且**时灵时不灵**（取决于链接器布局）。**这类 bug 最难查。**
+
+**v2（正确）—— 结构体方案**：
+
+```c
+struct edge_ai_put_arg put_arg;
+if (copy_from_user(&put_arg, (void __user *)arg, sizeof(put_arg)))  /* 大小固定 */
+    { ret = -EFAULT; break; }
+if (put_arg.len < 0 || put_arg.len > BUF_SIZE)                      /* 边界校验 */
+    { ret = -EINVAL; break; }
+mutex_lock(&kbuf_lock);
+memcpy(kbuf, put_arg.data, put_arg.len);
+klen = put_arg.len;
+mutex_unlock(&kbuf_lock);
+```
+
+**结构体方案优于 `strnlen_user`**：契约**显式**（必须传完整结构体）；**能传二进制数据**（可含 `\0`），不像字符串方案受 `\0` 限制。内核里 `struct i2c_msg`、`struct v4l2_buffer` 都是这个套路。
+
+⚠️ **`len < 0` 那半边判断是生死线**：`memcpy` 第三个参数是 `size_t`（无符号），`(size_t)-1` 会拷到天荒地老 → **内核堆溢出 → 可被提权**。
+
+### 六、code review 要点
+
+| 项 | 结论 |
+|---|---|
+| ⭐ `_IOC_TYPE(cmd) != MAGIC` **前置检查** | ✅ 用户自己加的（我没提示过），很专业——避免魔术字撞车 |
+| 未知命令 → **`-ENOTTY`** | ✅ 不是 `-EINVAL`（用户程序靠它区分"命令不支持" vs "参数不合法"） |
+| `case` 里声明变量 | ⚠️ **`case` 不构成作用域**！实测：两个 case 都写 `int len;` → `redeclaration` 错误 → 要加 `{}` → **K-036** |
+| 锁的作用域 | ✅ `copy_from_user` 在**锁外**（可能睡眠，**持锁睡眠是内核大忌**） |
+| `size_t → int` 转 ABI | ✅ `LEN` 用中间变量，没直接拷 `&klen`（64→32 位会语义混乱） |
+
+### 七、实测结果（✅ 全过）
+
+```
+Buffer length: 22                          ← LEN
+After CLEAR, buffer length: 0              ← CLEAR + LEN
+PUT succeeded, len = 22                    ← PUT
+After PUT, buffer length: 22               ← LEN
+ioctl returned ENOTTY as expected for invalid command
+EINVAL as expected for len > BUF_SIZE      ← 边界：超长
+EINVAL as expected for len < 0             ← 边界：负数
+```
+
+✅ 内容验证：`sudo cat /dev/edge_ai0` → `Hello from user space!`
+
+### 八、⚠️ 一个"假 bug"教训（→ K-038）
+
+`cat` 的输出**没有换行符**，紧贴在 shell 提示符前面，看上去像"完全没输出"，**我一度误判为"驱动和用户态不一致"的严重 bug**，白排查一轮。
+
+- **为什么没换行**：`klen = strlen(...)` 不含 `\0`，而 `"Hello from user space!"` 本身也没 `\n`
+- **核心概念**：**设备文件不做任何格式化**，`cat` 只把字节**原样搬运**。有没有换行取决于你写进去的内容
+- **教训**：验证"有没有数据"用 `wc -c` / `xxd`，**不要用眼睛**
+
+> **MCU 类比**：串口发 `"OK"` 而不是 `"OK\r\n"`，上位机就一行连一行。
+
+---
+
+## 🎉 1.2 结课（2026-09-29）
+
+### 验收（全部 ✅）
+
+- [x] `insmod` 后 `/dev/edge_ai0` **自动出现**（无需 `mknod`）
+- [x] 5 个 fops 回调全实现（`open`/`release`/`read`/`write`/`unlocked_ioctl`）
+- [x] `copy_to_user` / `copy_from_user` 跨边界
+- [x] `kmalloc` / `kfree` 内存生命周期
+- [x] 3 个 ioctl 命令 + 未知命令 `-ENOTTY`
+- [x] **用户态测试程序自写自编**
+- [x] 长度边界校验（超长 + 负数 → `EINVAL`）
+- [x] 引用计数保护（`Module is in use`）
+- [x] 错误回滚链完整 + `exit` 释放干净
+- [x] **对应 `SPEC.md` FR-28：达成**
+
+### 产出
+
+| 文件 | 内容 |
+|---|---|
+| `stage1-rk3566/drivers/edge_ai_evt/edge_ai_evt.c` | 驱动 |
+| `stage1-rk3566/drivers/edge_ai_evt/edge_ai_evt.h` | 共享 ABI 头文件 |
+| `stage1-rk3566/drivers/edge_ai_evt/test_edge_ai.c` | 用户态测试程序 |
+| `stage1-rk3566/docs/1.2-driver-notes.md` | 学习笔记（§一~§十二） |
+| 经验库 | 新增 K-034 ~ K-039（实测累计 **24** 条） |
+
 ### 进度
 
 | 小节 | 状态 |
 |------|------|
 | 1.0 环境探测 | ✅ |
 | 1.1 GPIO 与 LED | ✅ 结课 |
-| **1.2 字符设备驱动** | 🟡 **第 1、2 次完成**，第 3 次待做 |
-| 1.3 ~ 1.5 | ⬜ |
+| **1.2 字符设备驱动** | ✅ **结课**（4 次完成） |
+| 1.3 摄像头 V4L2 | ⬜ **下次起点** |
+| 1.4 串口与协议 | ⬜ |
+| 1.5 应用工程化 | ⬜ |
 
-**经验库累计**：19 条【实测】+ 15 条【通用】
+### ⏭️ 下次起点：1.3 摄像头 V4L2
+
+**开工前准备**：
+- ⬜ 确认摄像头到手；`ls -l /dev/video*` + `v4l2-ctl --list-devices`
+- ⬜ `v4l2-ctl --list-formats-ext` 看格式与分辨率
+- ⬜ `sudo apt install v4l-utils`（若缺）
+- ⬜ **绝不硬编码 `/dev/video0`**（K-016）—— 运行时枚举校验
+
+**核心概念**：V4L2 缓冲队列（`REQBUFS`→`mmap`→`QBUF`→`DQBUF`）、`mmap` 零拷贝取帧、格式协商
+
+**目标**：抓一帧存成 JPEG
+
+### 遗留
+
+- ⬜ `Makefile` 的 `KDIR` 仍指向板卡路径（实际被 `-C $HOME/tspi_sdk/kernel-6.1` 覆盖，可加注释）
+- ⬜ 可选补测：`len = BUF_SIZE`（正好满载）应成功
+- ⬜ `/dev/edge_ai0` 的 udev 规则（普通用户可访问）—— 可选
+- ⬜ 排针 UART 电压未量（阶段 2 接线前必做）
+- ⬜ 舵机/云台采购（SG90 ×2、二轴支架、独立 5V 电源，约 50 元）
+
+**经验库累计**：24 条【实测】+ 15 条【通用】

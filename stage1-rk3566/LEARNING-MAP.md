@@ -137,12 +137,18 @@ gpiochip0 [gpio0] 32 lines ... gpiochip4 [gpio4] 32 lines   （5 个 bank，各 
 > 正确做法（标准嵌入式工作流）：**在与编译内核同一台机器、同一棵源码树上编模块**，即虚拟机的 `~/tspi_sdk/kernel-6.1/`。
 > 现已封装为一键脚本：`module-deploy.sh edge_ai_evt`（rsync 拉源码 → 交叉编译 → scp 回传）。
 
-**分 3 次**：
+**分 4 次**：
 1. ✅ 最小可加载模块（`insmod` 打印 hello / `rmmod` 打印 bye）—— 2026-09-27
 2. ✅ 加 `file_operations` + 自动创建 `/dev/edge_ai0` —— 2026-09-27
-3. ⬜ 实现 ioctl 控制 + read 读事件队列 + 用户态测试程序
+3. ✅ `.read` + `kmalloc` 缓冲区 + ⭐ `copy_to_user` —— 2026-09-28
+4. ✅ `.write` + `.unlocked_ioctl`（3 个命令）+ 用户态测试程序 —— 2026-09-29
 
-**验收**：`insmod edge_ai_evt.ko` 后 `/dev/edge_ai0` 自动出现 ✅；用户态能 ioctl 配置 + read 取数 ⬜；`rmmod` 干净卸载 ✅
+**验收**：
+- ✅ `insmod` 后 `/dev/edge_ai0` **自动出现**（无需 `mknod`）
+- ✅ 用户态能 `read` 取数（`cat` 完整读出并 EOF 退出）
+- ✅ 用户态能 `ioctl` 配置（CLEAR / PUT / LEN），含长度边界校验与 `ENOTTY`
+- ✅ `rmmod` 干净卸载；引用计数保护生效
+- ✅ **对应 `SPEC.md` FR-28 达成**
 
 **对应 FR**：FR-28
 
@@ -294,30 +300,28 @@ graph TB
 |------|------|------|
 | 1.0 环境探测收尾 | ✅ **完成** | 2026-09-20 |
 | 1.1 GPIO 与 LED | ✅ **结课**（笔记：`docs/1.1-gpio-notes.md`） | 2026-09-21 |
-| 1.2 字符设备驱动 | 🟡 **进行中**（第 1、2 次 ✅；笔记：`docs/1.2-driver-notes.md`） | 2026-09-27 |
+| 1.2 字符设备驱动 | ✅ **结课**（4 次全部完成；笔记：`docs/1.2-driver-notes.md`） | 2026-09-29 |
 | 1.3 摄像头 V4L2 | ⬜ 未开始 | |
 | 1.4 串口与协议 | ⬜ 未开始 | |
 | 1.5 应用工程化 | ⬜ 未开始 | |
 
-### ⏭️ 下次起点：1.2 第 3 次（最后一次）—— `.read` + `.unlocked_ioctl`
+### ⏭️ 下次起点：1.3 摄像头 V4L2
 
-> ⚡ **开工第一件事：按 4 条改进意见调整代码**（用户明确要求提醒）
->
-> | # | 改进项 |
-> |---|--------|
-> | 1 | `printk` 宏与字符串之间加空格：`KERN_INFO "…"` |
-> | 2 | 日志加模块名前缀：`"edge_ai_evt: …"` |
-> | 3 | ⭐ 改用 `pr_fmt` + `pr_info`/`pr_err`（**`pr_fmt` 必须写在所有 `#include` 之前**） |
-> | 4 | `MODULE_VERSION` 升到 `"0.3"` |
->
-> 详见 `docs/1.2-driver-notes.md` §8.1 与 `docs/session-log.md` 2026-09-27（下半场）
+**目标**：让板卡从 USB 摄像头抓一帧并存成 JPEG（对应 `docs/PLAN.md` 1.3 的交付物）
 
-**目标**：实现 `.read` + `.unlocked_ioctl`，让 `cat /dev/edge_ai0` 能读出数据（闭环今天 `Invalid argument` 的问题）。
+**开工前先做的准备**：
+- ⬜ 确认摄像头是否到手；插上后 `ls -l /dev/video*` + `v4l2-ctl --list-devices` 确认节点
+- ⬜ `v4l2-ctl --list-formats-ext` 看支持的格式（MJPEG / YUYV）与分辨率
+- ⬜ 确认板卡装了 `v4l-utils`（缺则 `sudo apt install v4l-utils`）
+- ⬜ **绝不要硬编码 `/dev/video0`**（K-016）—— 必须运行时枚举校验
 
-**关键 API**：⭐ `copy_to_user()`、`kmalloc`/`kfree`、（可选）等待队列
+**核心概念（下次讲）**：
+- V4L2 **缓冲队列模型**：`VIDIOC_REQBUFS` → `mmap` → `QBUF` → `DQBUF` 的配对（呼应 K-004）
+- `mmap` 零拷贝取帧
+- 格式协商（`VIDIOC_S_FMT` / `VIDIOC_G_FMT`）
 
-**构建命令**：`module-deploy.sh edge_ai_evt`
+**关键 API**：`open` / `ioctl(VIDIOC_*)` / `mmap` / `munmap`
 
 按五步法走：1. 我讲原理 → 2. 我定目标 → 3. 我给思路 → 4. **你动手** → 5. 我 review
 
-> 💬 若对顺序有异议（比如想先做摄像头、早点看到图像），**随时提出**——地图是可以改的，改在开始之前成本最低。
+> 💬 若想调整顺序（比如先做 1.4 串口，或先补 1.2 的遗留项），**随时提出**——地图是可以改的，改在开始之前成本最低。
