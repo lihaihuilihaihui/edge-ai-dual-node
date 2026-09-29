@@ -574,6 +574,129 @@
 
 ---
 
+### K-035 【实测】IDE 报"应输入 )"而不是"未定义"——语法错 = 宏展开出了非法代码
+- **日期**：2026-09-28
+- **现象**：板卡上交叉编译**完全成功**、模块运行正常，但 VS Code 里每个 `pr_info` / `pr_err` 都飘红，错误是 **`应输入 ")"`（语法错误）**，**不是** `未定义标识符`
+- **根因**：`KBUILD_MODNAME` 未定义 → 宏展开出非法语法：
+  ```
+  pr_info("x")  →  printk(KERN_INFO pr_fmt("x"))
+                →  printk(KERN_INFO KBUILD_MODNAME ": " "x")
+                →  printk("\001" "6" KBUILD_MODNAME ": " "x")
+                                        └──── 裸标识符夹在字符串字面量中间 ────┘  → 语法错
+  ```
+  - `KBUILD_MODNAME` **不在任何头文件里定义**（`printk.h` 里只在注释出现过）
+  - 它是 **kbuild 编译时用 `-D` 注入的** → GCC 有、IntelliSense 没有 → 两者不一致
+- **推理链（关键技巧）**：
+
+  | IDE 报什么 | 说明什么 |
+  |-----------|---------|
+  | `identifier "pr_info" is undefined` | IntelliSense **找不到** `linux/printk.h` → includePath 没配好 |
+  | **`应输入 ")"`（语法错）** | 头文件**找到了、宏也展开了**，只是展开结果里有未定义的宏 |
+
+- **解法**：`.vscode/c_cpp_properties.json` 的 `defines` 里加
+  ```json
+  "KBUILD_MODNAME=\"edge_ai_evt\""
+  ```
+  值只是**占位**（真实值永远由 kbuild 给），所以以后加新模块不用改。
+  改完执行 `C/C++: Reset IntelliSense Database` 或 `Developer: Reload Window`
+- **验证**：`grep -o '\-DKBUILD_MODNAME=[^ ]*' .edge_ai_evt.o.cmd`
+- **MCU 类比**：Keil 的 `Options for Target → C/C++ → Define` 里配的宏，Keil 编译时认识，但 VSCode + C/C++ 插件不知道 Keil 配了哪些 `-D` → 同样飘红
+- **关联**：`.vscode/c_cpp_properties.json`；`stage1-rk3566/drivers/edge_ai_evt/`
+
+---
+
+### K-036 【实测】`case` 不构成作用域——里面声明的变量会"泄漏"到整个 switch 块
+- **日期**：2026-09-29
+- **现象**：想在 `case EDGE_AI_IOC_LEN:` 里直接写 `int len;`，不确定合不合法
+- **根因**：`case X:` 只是**标签**，不是作用域。真正的块是 `switch` 后面那对 `{}`。所以 case 里声明的变量作用域是**整个 switch 块**
+- **实测（板卡 GCC 11.4）**：
+
+  | 情况 | 结果 |
+  |------|------|
+  | 单个 case 里 `int len;` | ✅ **能编译**（连 `-std=c11 -Werror` 都通过，退出码 0） |
+  | **两个 case 都写 `int len;`** | ❌ `error: redeclaration of 'len' with no linkage`（退出码 1） |
+
+- **解法**：case 里要声明变量就**加一对 `{}`** 包起来：
+  ```c
+  case FOO: {
+      int len;
+      ...
+      break;
+  }
+  ```
+- **教训**：**"能编译"≠"正确"**。单个 case 能过只是因为恰好没有同名冲突；等第二个 case 也声明同名变量时才爆——那时你已经忘了当初为什么这么写
+- **关联**：`stage1-rk3566/drivers/edge_ai_evt/edge_ai_evt.c`
+
+---
+
+### K-037 【实测】`copy_from_user` 用"固定长度"拷用户数据 = 运气型 bug
+- **日期**：2026-09-29
+- **现象**：接口约定"`arg` 是指向用户字符串的指针"，驱动这样写：
+  ```c
+  char user_buf[BUF_SIZE];
+  copy_from_user(user_buf, (char __user *)arg, BUF_SIZE);   /* 无条件拷 256 字节 */
+  ```
+  测试程序传 `"Hello from user space!"`（23 字节）—— **居然跑通了**
+- **根因**：**驱动读的字节数超过了用户实际提供的**
+  - 这次没崩，是因为字符串字面量在 `.rodata` 段、后面紧跟着别的数据（同页内），恰好都在映射范围 → **是运气**
+  - 如果字符串正好落在**页尾**附近，后面是未映射页 → `copy_from_user` 返回非 0 → 用户看到莫名其妙的 `Bad address`
+  - 最坑的是**时灵时不灵**（取决于链接器把数据放在哪）——改一行代码可能就从"能跑"变成"不能跑"
+- **解法（两种）**：
+  1. **结构体方案（推荐）**：`_IOW(MAGIC, nr, struct xxx_arg)`。先 `copy_from_user` 整个结构体（**大小固定已知**），取出 `len` 字段**校验后再用**
+  2. `strnlen_user()` 先量长度：返回 `0` = 地址非法；`> maxlen` = 太长；`<= maxlen` = 长度（**含 `\0`**）
+- **结构体方案为何更优**：契约**显式**（必须传完整结构体）；**能传二进制数据**（可含 `\0`），不像字符串方案受 `\0` 限制。内核里 `struct i2c_msg`、`struct v4l2_buffer` 都是这个套路
+- ⚠️ **必须同时校验 `len` 的上下界**：
+  ```c
+  if (put_arg.len < 0 || put_arg.len > BUF_SIZE) return -EINVAL;
+  ```
+  **少了 `len < 0` 那半边 = 内核堆溢出漏洞**：`memcpy` 第三个参数是 `size_t`（无符号），`(size_t)-1` 会拷到天荒地老 → 可用于提权
+- **MCU 类比**：串口收帧不能"假定对方一定发满 256 字节"，必须按 LEN 字段/结束符处理
+- **关联**：`stage1-rk3566/docs/1.2-driver-notes.md` §10.4
+
+---
+
+### K-038 【实测】用眼睛判断"有没有读到数据"会被无换行输出骗
+- **日期**：2026-09-29
+- **现象**：`sudo ./test_edge_ai && sudo cat /dev/edge_ai0`，`cat` 那部分**看起来完全没输出**，一度被误判成"驱动认为有 22 字节、用户态却读不到"的严重 bug，白排查了一轮
+- **根因**：输出的 `"Hello from user space!"` **没有换行符**，紧贴在 shell 提示符前面：
+  ```
+  EINVAL as expected for len > BUF_SIZE
+  Hello from user space!lihaihui@lckfb:...$
+  ```
+  肉眼扫过去容易当成"提示符前面的一点噪声"而忽略
+- **为什么没换行**：`klen = strlen(...)` 不含 `\0`，而 `"Hello from user space!"` 本身也没有 `\n`
+  - 对比：`init` 里预填的 `"Hello from edge_ai_evt module!\n"` **带** `\n` → 有换行
+- **核心概念**：**设备文件不做任何格式化**。`cat` 只把驱动的字节**原样搬运**到 stdout；有没有换行完全取决于你写进缓冲区的内容（驱动不认识 `\n`，它只是 `0x0A`）
+- **习惯（解法）**：
+  ```bash
+  sudo cat /dev/edge_ai0 | wc -c      # 数字节，最直接
+  sudo cat /dev/edge_ai0 | xxd        # 看十六进制，还能区分 空格 / \0 / 什么都没有
+  ```
+- **MCU 类比**：串口发 `"OK"` 而不是 `"OK\r\n"`，上位机串口助手就一行连一行 —— 传输层不管格式
+- **教训**：**验证"有没有数据"要用工具，不要用眼睛。**
+- **关联**：`stage1-rk3566/docs/1.2-driver-notes.md` §10.6
+
+---
+
+### K-039 【实测】`register_chrdev` 成功返回的是**主设备号本身**（正数），不是 0
+- **日期**：2026-09-28
+- **现象**：审代码时觉得 `if (major < 0)` 这个判断"看着怪"（一般习惯写 `if (ret)`）
+- **根因**：**内核里"成功返回什么"因函数而异，完全不统一**：
+
+  | 函数 | 成功返回 | 失败返回 | 判错方式 |
+  |------|---------|---------|---------|
+  | `register_chrdev` | ⚠️ **主设备号（正数）** | 负 errno | `major < 0` |
+  | `alloc_chrdev_region` | `0` | 负 errno | `ret < 0` |
+  | `class_create` / `device_create` | 指针 | `ERR_PTR(-errno)` | `IS_ERR(p)` + `PTR_ERR(p)` |
+  | `copy_to_user` / `copy_from_user` | `0` | **未拷贝的字节数（正数！）** | `if (ret)` |
+
+- **不能写 `if (!major)`**：主设备号 `0` 本身是合法值（虽然动态分配通常不会给 0）
+- **顺带澄清两套接口**：`register_chrdev` 是**一步到位的老接口**（内部就是 `__register_chrdev(major, 0, 256, name, fops)`），**独占该主号下全部 256 个次设备号**；要"一个驱动管多个设备"必须用 `alloc_chrdev_region` + `cdev_init` / `cdev_add`
+- **教训**：**内核 API 的返回值约定必须逐个查头文件注释，凭直觉必翻车**
+- **关联**：`stage1-rk3566/docs/1.2-driver-notes.md` §7.1b、§7.3
+
+---
+
 ## 七、待填充区域
 
 > 以下是本项目**尚未遇到但很可能遇到**的领域，踩坑后追加。
@@ -593,7 +716,7 @@
 
 | 来源 | 条数 |
 |------|------|
-| 【实测】（本项目亲历） | 19 |
+| 【实测】（本项目亲历） | 24 |
 | 【通用】（已知陷阱，未亲历） | 15 |
 
 > 💡 **启发式观察**：当一个坑被踩过两次，说明它不是"坑"而是"知识盲区"，应该把根因写进 `SKILL.md` 或阶段学习笔记，而不只是记在这里。
