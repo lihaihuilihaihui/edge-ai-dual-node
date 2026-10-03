@@ -697,6 +697,129 @@
 
 ---
 
+### K-040 【实测】`v4l2-ctl` 不带 `-d` 会默认操作 `/dev/video0`——而且输出“看起来很正常”
+- **日期**：2026-10-03
+- **现象**：查摄像头支持的格式，忘了带 `-d`：
+  ```bash
+  $ v4l2-ctl --list-formats-ext        # ❌ 默认 /dev/video0
+  ioctl: VIDIOC_ENUM_FMT
+          Type: Video Capture Multiplanar
+          [0]: 'UYVY' ...
+  ```
+  **命令没报错、输出完全正常**，很容易以为“我的摄像头就这能力”——其实看的是 RK3566 内置 ISP（MIPI CSI），**跟 USB 摄像头毫无关系**
+- **根因**：`v4l2-ctl` 不指定 `-d` 时默认用 `/dev/video0`。而板卡上 `video0`~`video7` 是 RKISP（MIPI），USB 摄像头在 `video10`
+- **解法**：**永远显式 `-d`**，且先用 `v4l2-ctl --list-devices` 确认设备身份
+  ```bash
+  v4l2-ctl --list-devices
+  v4l2-ctl -d /dev/video10 --list-formats-ext
+  ```
+- **线索**：`Type: Video Capture Multiplanar`（多平面）vs `Type: Video Capture`（单平面）——**这个差异直接决定代码里 `type` 字段填什么**（K-043）
+- **教训**：**“没有报错”不等于“看的对设备”。** 这是 K-016（绝不硬编码设备节点）的典型实践
+- **关联**：`stage1-rk3566/docs/1.3-v4l2-notes.md` §1.3；`LEARNING-MAP.md` 1.3；K-016
+
+---
+
+### K-041 【实测】`Capabilities` vs `Device Caps`——判断节点能力必须看后者
+- **日期**：2026-10-03
+- **现象**：UVC 摄像头有两个 `/dev/video*` 节点，不知用哪个：
+  ```bash
+  $ v4l2-ctl -d /dev/video10 --info
+          Capabilities : 0x84a00001    ← Video Capture + Metadata Capture + Streaming
+          Device Caps  : 0x04200001    ← Video Capture + Streaming
+  $ v4l2-ctl -d /dev/video11 --info
+          Capabilities : 0x84a00001    ← 一模一样！
+          Device Caps  : 0x04a00000    ← Metadata Capture + Streaming
+  ```
+- **根因**：`VIDIOC_QUERYCAP` 返回两个字段，含义不同：
+
+  | 字段 | 含义 |
+  |------|------|
+  | `capabilities` | **整个驱动**的能力 |
+  | **`device_caps`** | **这个具体节点**的能力 ← **判断依据** |
+
+  两个节点 `capabilities` 相同，但 `device_caps` 不同。**只读 `capabilities` 会误判**
+- **解法**：代码里检查 `cap.device_caps & V4L2_CAP_VIDEO_CAPTURE`（或看 `v4l2-ctl --list-devices` 的节点顺序）
+- **验证**：`video10` = 视频流（`Video Capture`），`video11` = 元数据（`Metadata Capture`）；抓帧必须用 `video10`
+- **关联**：`stage1-rk3566/docs/1.3-v4l2-notes.md` §1.4
+
+---
+
+### K-042 【实测】V4L2 的 `bytesused` ≠ `length`——写文件必须用 `bytesused`
+- **日期**：2026-10-03
+- **现象**：MJPG 640×480 抓帧，实测：
+  ```
+  QUERYBUF: length    = 614400      ← 614400 = 640×480×2（按【未压缩】尺寸分配）
+  DQBUF:    bytesused =  54716      ← 实际帧只有 54.7 KB
+  ```
+- **根因**：`struct v4l2_buffer` 里两个长度字段含义不同：
+
+  | 字段 | 含义 |
+  |------|------|
+  | `length` | buffer 的**总容量** |
+  | **`bytesused`** | 这一帧**实际有效数据的字节数** |
+
+  UVC 驱动按“**最大可能的帧大小**”保守分配（保证格式被换成 YUYV 也装得下）→ `length` 是**未压缩**尺寸
+- **解法**：写文件/处理数据用 `buf.bytesused`
+- **用错会怎样**：写出 614400 字节，其中 **559684 字节是垃圾**（未填的残留数据）→ 文件大概率打不开
+- **附带数据**：压缩比 `614400 / 54716 ≈ 11.2`；带宽 `54716 × 30 ≈ 1.64 MB/s`（同分辨率 YUYV 需 18.4 MB/s，**差 11 倍**）
+- **关联**：`stage1-rk3566/docs/1.3-v4l2-notes.md` §2.5、§3.4
+
+---
+
+### K-043 【实测】V4L2 的 `S_FMT` / `REQBUFS` 是“传入传出”——必须用返回的实际值
+- **日期**：2026-10-03
+- **现象**：请求 MJPG 640×480，打印时发现结构体里的值“看起来就是自己设的”；后来意识到**驱动可能改过它**
+- **根因**：这类 ioctl 的参数结构体同时承担**输入和输出**：
+  - `VIDIOC_S_FMT`：你传请求，**驱动把实际生效格式回填到同一个结构体**
+  - `VIDIOC_REQBUFS`：你传想要的 buffer 数，**驱动回填实际给了几个**
+- **解法**：
+  ```c
+  req.count = 4;                        /* 输入 */
+  ioctl(fd, VIDIOC_REQBUFS, &req);
+  for (i = 0; i < req.count; i++) { }   /* ✅ 用返回后的 count，不是写死的 4 */
+
+  ioctl(fd, VIDIOC_S_FMT, &fmt);        /* 之后 fmt 里已经是实际值 */
+  ```
+  要打印“我请求了什么”，必须在调用**前**存一份副本
+- **铁律**：**凡是你“请求”的东西，都要读回确认实际值**——和串口波特率、时钟树配置一个道理
+- **关联**：`stage1-rk3566/docs/1.3-v4l2-notes.md` §2.5；`stage1-rk3566/apps/v4l2-capture/capture.c`
+
+---
+
+### K-044 【实测】`DQBUF` 之后 buffer 归用户——出错路径必须先 `QBUF` 再清理
+- **日期**：2026-10-03
+- **现象**：写抓帧程序时定义了 `requeue:` 标签但没用到，GCC 警告 `-Wunused-label`。当时本能想“删掉标签”，仔细一想：**这个标签本来就该用上**
+- **根因**：V4L2 的 buffer 是**借还制**：
+  - `DQBUF` 之后，该 buffer 的**归属权转到用户**，驱动在你 `QBUF` 还回去之前**不会碰它**
+  - 所以 `DQBUF` 与 `QBUF` 之间的**任何错误路径**，如果直接 `goto cleanup` 走人，就是“**借了东西没还**”
+- **解法**：`DQBUF` 后所有错误分支都 `goto requeue`（先还 buffer，再走清理）：
+  ```c
+  ioctl(fd, VIDIOC_DQBUF, &buf);
+  fp = fopen(OUT_FILE, "wb");
+  if (!fp) { perror("fopen"); goto requeue; }   /* ✅ 不是 cleanup */
+  ```
+- **为什么重要**：
+  - **单帧场景**：`close(fd)` 会让内核强制回收所有 buffer（V4L2 规范保证），所以不会崩——**只是逻辑不严谨**
+  - **多帧/连续采集场景**：buffer 泄漏 → 可用 buffer 耗尽 → 驱动采不到数据 → `DQBUF` **永远阻塞、画面卡死**
+- **教训**：**编译器警告 `-Wunused-label` 不只是“删掉就好”——先想“为什么当初想写这个标签”**
+- **关联**：`stage1-rk3566/docs/1.3-v4l2-notes.md` §2.3、§四；`LEARNING-MAP.md` 引用的 K-004（QBUF/DQBUF 配对）
+
+---
+
+### K-045 【通用】`/dev` 节点的时间戳能直接告诉你“哪个是刚插上的设备”
+- **日期**：2026-10-03
+- **现象**：板卡上有 12 个 `/dev/video*`，分不清哪个是 USB 摄像头：
+  ```bash
+  crw-rw---- 1 root video 81,  0 Jul 29 21:41 /dev/video0      ← 开机时创建
+  crw-rw---- 1 root video 81, 13 Oct  3 11:33 /dev/video10     ← 11:33 刚出现
+  ```
+- **根因**：`/dev` 是 **devtmpfs**（内存文件系统），节点在**设备被驱动认领的瞬间**创建。所以时间戳 = 设备“上线”时间
+- **用法**：插了新 USB 设备后 `ls -l /dev/xxx`，时间戳与“开机时间”不同的就是刚插上的
+- **配合使用**：`v4l2-ctl --list-devices` 的“总线信息”（如 `usb-fd800000.usb-1`）能进一步确认设备归属
+- **关联**：`stage1-rk3566/docs/1.3-v4l2-notes.md` §1.1
+
+---
+
 ## 七、待填充区域
 
 > 以下是本项目**尚未遇到但很可能遇到**的领域，踩坑后追加。
@@ -716,7 +839,7 @@
 
 | 来源 | 条数 |
 |------|------|
-| 【实测】（本项目亲历） | 24 |
+| 【实测】（本项目亲历） | 30 |
 | 【通用】（已知陷阱，未亲历） | 15 |
 
 > 💡 **启发式观察**：当一个坑被踩过两次，说明它不是"坑"而是"知识盲区"，应该把根因写进 `SKILL.md` 或阶段学习笔记，而不只是记在这里。
