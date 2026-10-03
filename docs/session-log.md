@@ -1459,7 +1459,7 @@ frame1.jpg: JPEG image data, baseline, precision 8, 640x480, components 3
 ### ⏭️ 下次起点：1.3 第 2 次
 
 1. ⬜ **运行时枚举设备节点**（K-016）：遍历 `/dev/video*`，用 `QUERYCAP` 找 `uvcvideo` + `V4L2_CAP_VIDEO_CAPTURE`，替掉硬编码的 `/dev/video10`
-2. ⬜ **抓多帧 / 存图序列**：体会"借还"循环，**实测真实 FPS**（地图里写的 30.23fps 是调研数据，**未实测**）
+2. ⬜ **抓多帧 / 存图序列**：体会"借还"循环；**复测真实 FPS**（`references/hardware.md` §2.5 已有 2026-09-10 实测：MJPG 640×480 稳态 **30.23 fps**）
 3. ⬜ **buffer 快速周转改造**：`DQBUF → memcpy → QBUF（立刻还）→ 慢慢处理`
 4. ⬜ （可选）YUYV 对比实验：实测带宽/CPU 差异，验证 §带宽测算
 

@@ -172,11 +172,32 @@ Camera Controls: auto_exposure(当前=3 Aperture Priority)
 
 **抓帧验证**
 ```bash
-sudo v4l2-ctl -d /dev/video10 \
+# ⚡ 不需要 sudo：节点为 root:video 660，用户在 video 组
+v4l2-ctl -d /dev/video10 \
   --set-fmt-video=width=640,height=480,pixelformat=MJPG \
   --stream-mmap --stream-count=1 --stream-to=/tmp/cam_test.jpg
-# 实测：36585 字节，魔数 ff d8 ff（JPEG SOI）✅
+# 实测（2026-09-10）：36585 字节，魔数 ff d8 ff（JPEG SOI）✅
 ```
+
+**⚠️ 用 `v4l2-ctl` 必须带 `-d /dev/video10`**
+
+不带 `-d` 时默认操作 **`/dev/video0`**（RK3566 内置 ISP，MIPI CSI 路径），输出**看起来正常但看的是另一个设备**。
+另：`video0`~`video9` 全部属于 RKISP，本项目**不用**（没接 MIPI 摄像头）。→ K-040、K-041
+
+**⭐ 抓帧实测数据（2026-10-03，自写 `capture.c`）**
+
+| 项 | 值 |
+|----|-----|
+| `REQBUFS` 返回 | 4 个 buffer |
+| `length`（buffer 容量） | **614400** = 640×480×2（**按未压缩尺寸分配**） |
+| `bytesused`（实际帧） | **54716** 字节 |
+| 压缩比 | `614400 / 54716 ≈ **11.2 倍**` |
+| 带宽 | `54716 × 30 ≈ **1.64 MB/s**` |
+| 同分辨率 YUYV（理论） | 18.4 MB/s（**差 11 倍**） |
+| 平面类型 | `V4L2_BUF_TYPE_VIDEO_CAPTURE`（**单平面**，不是 MPLANE） |
+
+> 📌 写文件必须用 `buf.bytesused`，**不能用 `buf.length`**（否则尾部有近 560KB 垃圾）→ K-042
+> 📌 `S_FMT` / `REQBUFS` 是**传入传出**，必须用返回的实际值 → K-043
 
 ---
 
