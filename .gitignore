@@ -67,6 +67,9 @@ stage0-toolchain/practice/**/*.d
 stage1-rk3566/drivers/**/test_*
 !stage1-rk3566/drivers/**/test_*.c
 
+# 应用目录下的编译产物（源码要提交，产物不提交）
+stage1-rk3566/apps/**/capture
+
 # 系统备份镜像
 *.img.gz
 backup/
