@@ -166,9 +166,22 @@ gpiochip0 [gpio0] 32 lines ... gpiochip4 [gpio4] 32 lines   （5 个 bank，各 
 
 **实测前提**：摄像头 `b249:b081`，MJPG 640×480@30fps 稳态 30.23fps
 
-**动手产出**：`camera.cpp` —— 打开 → 协商格式 → 申请缓冲 → 循环取帧 → 存一张 JPEG
+**分 2 次**：
+1. ✅ 环境探测 + `v4l2-ctl` 打通链路 + **自写 `capture.c` 抓一帧存 JPEG** —— 2026-10-03
+2. ⬜ 运行时枚举设备节点（K-016）+ 抓多帧/存图序列 + YUYV 对比实验
 
-**验收**：存下 640×480 JPEG 并能打开看到画面
+**实测数据（2026-10-03）**：
+- 设备：`USB Camera`；采集节点 **`/dev/video10`**（`video11` 是 metadata 节点）
+- 格式：`MJPG` / `YUYV` 各 3 档（1600×1200 / 1280×720 / 640×480）
+- **MJPG 640×480@30fps**：每帧 **54.7 KB**，带宽 **1.64 MB/s**
+- 同分辨率 YUYV 需 **18.4 MB/s**（USB 2.0 预算 ~19 MB/s）→ **差 11 倍**
+- 压缩比 `614400 / 54716 ≈ **11.2 倍**`
+
+**动手产出**：`apps/v4l2-capture/capture.c` —— open → QUERYCAP → S_FMT/G_FMT → REQBUFS → mmap → QBUF → STREAMON → DQBUF → 存 JPEG → QBUF → STREAMOFF
+
+**验收**：✅ 存下 640×480 JPEG，能在电脑上正常显示画面
+
+**笔记**：`docs/1.3-v4l2-notes.md`
 
 **对应 FR**：FR-20
 
@@ -301,26 +314,24 @@ graph TB
 | 1.0 环境探测收尾 | ✅ **完成** | 2026-09-20 |
 | 1.1 GPIO 与 LED | ✅ **结课**（笔记：`docs/1.1-gpio-notes.md`） | 2026-09-21 |
 | 1.2 字符设备驱动 | ✅ **结课**（4 次全部完成；笔记：`docs/1.2-driver-notes.md`） | 2026-09-29 |
-| 1.3 摄像头 V4L2 | ⬜ 未开始 | |
+| 1.3 摄像头 V4L2 | 🟡 **进行中**（第 1 次 ✅：抓帧存 JPEG；笔记：`docs/1.3-v4l2-notes.md`） | 2026-10-03 |
 | 1.4 串口与协议 | ⬜ 未开始 | |
 | 1.5 应用工程化 | ⬜ 未开始 | |
 
-### ⏭️ 下次起点：1.3 摄像头 V4L2
+### ⏭️ 下次起点：1.3 第 2 次 —— 设备枚举 + 抓多帧
 
-**目标**：让板卡从 USB 摄像头抓一帧并存成 JPEG（对应 `docs/PLAN.md` 1.3 的交付物）
+**已完成**：
+- ✅ 环境探测（识别 `video10` = 采集节点、`video11` = metadata；MJPG 可用）
+- ✅ `v4l2-ctl` 打通链路
+- ✅ **自写 `capture.c`：抓一帧存 JPEG，画面正常**
 
-**开工前先做的准备**：
-- ⬜ 确认摄像头是否到手；插上后 `ls -l /dev/video*` + `v4l2-ctl --list-devices` 确认节点
-- ⬜ `v4l2-ctl --list-formats-ext` 看支持的格式（MJPEG / YUYV）与分辨率
-- ⬜ 确认板卡装了 `v4l-utils`（缺则 `sudo apt install v4l-utils`）
-- ⬜ **绝不要硬编码 `/dev/video0`**（K-016）—— 必须运行时枚举校验
+**下次要做的**：
+1. ⬜ **运行时枚举设备节点**（K-016 要求）：遍历 `/dev/video*`，用 `QUERYCAP` 找 `uvcvideo` + `V4L2_CAP_VIDEO_CAPTURE`，替掉硬编码的 `#define DEV_NAME "/dev/video10"`
+2. ⬜ **抓多帧 / 存图序列**：体会 QBUF/DQBUF “借还”循环；实测真实 FPS
+3. ⬜ **buffer 快速周转改造**：`DQBUF → memcpy → QBUF（立刻还）→ 慢慢处理`
+4. ⬜ （可选）**YUYV 对比实验**：同分辨率切 YUYV，实测带宽/CPU 差异
 
-**核心概念（下次讲）**：
-- V4L2 **缓冲队列模型**：`VIDIOC_REQBUFS` → `mmap` → `QBUF` → `DQBUF` 的配对（呼应 K-004）
-- `mmap` 零拷贝取帧
-- 格式协商（`VIDIOC_S_FMT` / `VIDIOC_G_FMT`）
-
-**关键 API**：`open` / `ioctl(VIDIOC_*)` / `mmap` / `munmap`
+> 📝 **待验证**：地图初稿里写的“MJPG 640×480@30fps 稳态 30.23fps”是**调研数据、尚未实测**——第 2 次抓多帧时把它测掉。
 
 按五步法走：1. 我讲原理 → 2. 我定目标 → 3. 我给思路 → 4. **你动手** → 5. 我 review
 

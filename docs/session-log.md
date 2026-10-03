@@ -1308,4 +1308,169 @@ EINVAL as expected for len < 0             ← 边界：负数
 - ⬜ 排针 UART 电压未量（阶段 2 接线前必做）
 - ⬜ 舵机/云台采购（SG90 ×2、二轴支架、独立 5V 电源，约 50 元）
 
-**经验库累计**：24 条【实测】+ 15 条【通用】
+---
+
+## 2026-10-03 · 1.3 第 1 次 —— 摄像头 V4L2 抓帧存 JPEG ✅
+
+### 一、环境探测（两个坑）
+
+#### 坑 1：`v4l2-ctl` 不带 `-d` 默认用 `/dev/video0`
+
+板卡上有 **12 个 `/dev/video*`**：
+
+```bash
+crw-rw---- 1 root video 81,  0 Jul 29 21:41 /dev/video0      ← 开机时创建（RKISP/MIPI）
+crw-rw---- 1 root video 81, 13 Oct  3 11:33 /dev/video10     ← 11:33 刚插上（USB 摄像头）
+```
+
+**⭐ 时间戳技巧**：`/dev` 是 devtmpfs，节点在**设备被驱动认领的瞬间**创建。所以时间戳 = 设备上线时间。插新 USB 设备后 `ls -l /dev/xxx` 一眼分辨。
+
+用户第一次查格式忘带 `-d` → 查到的是 **`/dev/video0`（RK3566 内置 ISP）** 的格式，**命令没报错、输出看起来完全正常**，极易误判。→ **K-040**
+
+#### 坑 2：`Capabilities` vs `Device Caps`
+
+| | `video10` | `video11` |
+|---|---|---|
+| `Capabilities` | `0x84a00001` | `0x84a00001`（**一样**） |
+| **`Device Caps`** | Video Capture + Streaming | Metadata Capture + Streaming |
+
+**判断节点能力必须看 `device_caps`**，只读 `capabilities` 会误判。→ **K-041**
+
+**结论**：`/dev/video10` = **采集节点** ✅，`/dev/video11` = metadata 节点（不用）。
+
+### 二、摄像头能力 + ⭐ 带宽测算（实测验证了预测）
+
+```
+MJPG: 1600x1200@30fps, 1280x720@30fps, 640x480@30fps
+YUYV: 1600x1200@ 5fps, 1280x720@10fps, 640x480@30fps
+```
+
+**YUYV（未压缩，2 字节/像素）**：
+
+| 分辨率 | 每帧 | 帧率 | 带宽 |
+|--------|------|------|------|
+| 640×480 | 600 KB | 30 | **18.4 MB/s** |
+| 1280×720 | 1.8 MB | 10 | **18.4 MB/s** |
+| 1600×1200 | 3.7 MB | 5 | **19.2 MB/s** |
+
+**三行带宽几乎一样（~18-19 MB/s）→ USB 2.0 等时传输的预算上限**。摄像头想要更多？总线不答应 → 只能降帧率。
+
+**MJPG 压缩 11 倍（实测）→ 带宽富余 → 全分辨率 30fps。**
+
+### 三、Step 1 原理：V4L2 的"借还"模型
+
+**队列模型 = "空桶传送带"**：
+- `QBUF` = 把空桶放上传送带（"这个你可以装"）
+- 驱动 = 一边采集一边往桶里装水
+- `DQBUF` = 从完成端拿走一个装满的桶（阻塞等）；**此时 buffer 归用户**
+- 用完 `QBUF` = 倒空桶，重新放回传送带
+
+**忘了 `QBUF` → 桶耗尽 → 驱动采不到数据 → `DQBUF` 永远阻塞、画面卡死**（V4L2 最经典的 bug）
+
+> **MCU 类比**：就是 **DMA + 多缓冲**。`QBUF` ≈ 挂描述符链，`DQBUF` ≈ 完成中断里取数，用完再挂回去。
+> 唯一区别：Linux 里"通知"是**应用主动 `DQBUF` 阻塞等**，不是中断回调。
+
+**为什么用 `mmap` 而不是 `read()`**：`read()` 要内核拷一份到用户空间（640×480 YUYV 30fps = 每秒拷 18MB，CPU 全耗在搬运上）；`mmap` 是**零拷贝**。
+
+### 四、两个热身目标都完成
+
+**目标 A（`v4l2-ctl` 一把梭）** ✅
+
+```bash
+v4l2-ctl -d /dev/video10 --set-fmt-video=width=640,height=480,pixelformat=MJPG \
+  --stream-mmap --stream-count=1 --stream-to=frame.jpg
+```
+
+**目标 B（自写 `capture.c`）** ✅ 一次通过
+
+```
+[1] open /dev/video10 success, fd = 3
+[2] QUERYCAP 成功: driver=uvcvideo, card=USB Camera: USB Camera
+[3] S_FMT 请求: 640x480 MJPG
+[4] G_FMT 生效: width=640, height=480, pixelformat=MJPG
+[5] REQBUFS 成功, 驱动给了 4 个buffer
+[6] buffer[0]: length=614400, offset=0       mmap=0x7f85eaa000
+[6] buffer[1]: length=614400, offset=614400  mmap=0x7f85e14000
+[6] buffer[2]: length=614400, offset=1228800 mmap=0x7f85d7e000
+[6] buffer[3]: length=614400, offset=1843200 mmap=0x7f85ce8000
+[7] buffer[0..3] 入队列成功
+[8] STREAMON: 开始采集
+[9] DQBUF: 取出一帧成功, index=0, bytesused=54716
+[10] 写入 frame1.jpg (54716字节)
+[11] buffer[0] 还回队列成功
+[12] STREAMOFF: 停止采集
+[13] 清理完成
+```
+
+```bash
+$ file frame1.jpg
+frame1.jpg: JPEG image data, baseline, precision 8, 640x480, components 3
+```
+
+✅ **能在电脑上正常显示画面**（最终验收）
+
+### 五、⭐ 实测数据解读
+
+| 数字 | 含义 |
+|------|------|
+| `length=614400` | = 640×480×2 → **MJPG 格式下 buffer 按未压缩尺寸分配**（驱动保守，保证换成 YUYV 也装得下） |
+| `bytesused=54716` | 实际帧大小；**压缩比 614400/54716 ≈ 11.2 倍** |
+| 带宽 `54716×30 ≈ 1.64 MB/s` | **预测 ~1.5 MB/s → 实测 1.64 MB/s，吻合** ✅；同分辨率 YUYV 需 18.4 MB/s（差 11 倍） |
+| mmap 地址递减、offset 递增 | 两者无关：`offset` 是设备侧布局，`mmap` 地址由内核选（从高往低分配） |
+
+### 六、code review
+
+**亮点**：
+- ⭐ **`buffers[buf.index]`** —— 没有硬编码 `[0]`（`DQBUF` 的 index 由驱动给，不能假设总是 0）
+- ⭐ **`buf.bytesused`** —— 用对了字段（K-042）
+- `MAP_FAILED` 判断（不是判 `NULL`）
+- `req.count < 2` 防护 + 用**返回后的** `req.count`
+- `G_FMT` 后主动检查 pixelformat 是否真是 MJPG
+- fourcc 用位运算拆字节（不依赖字节序）
+- 完整错误处理 + `goto` 统一清理
+
+**改动（2 处）**：
+1. **`fopen` 失败 → `goto requeue`**（不是 `goto cleanup`）。编译器 `-Wunused-label` 提醒了"`requeue` 定义了没用"——**而用户的意图本来是对的，只是没接上线**。规则：**`DQBUF` 与 `QBUF` 之间所有错误路径都必须先还 buffer**（单帧时 `close` 会兜底，但多帧时 buffer 泄漏会让采集卡死）→ **K-044**
+2. `S_FMT` 的打印改为字面量（因为 `S_FMT` 是传入传出，结构体里已是实际值）→ **K-043**
+
+### 七、本轮新增经验
+
+**K-040**（`v4l2-ctl` 默认设备）、**K-041**（`capabilities` vs `device_caps`）、**K-042**（`bytesused` vs `length`）、**K-043**（`S_FMT`/`REQBUFS` 传入传出）、**K-044**（`DQBUF` 后必须先还 buffer）、**K-045**（`/dev` 时间戳识别新设备）
+
+### 八、产出
+
+| 文件 | 内容 |
+|---|---|
+| `apps/v4l2-capture/capture.c` | 抓帧程序（~200 行，自己写） |
+| `apps/v4l2-capture/frame1.jpg` | 抓到的帧（已被 `.gitignore` 的 `*.jpg` 覆盖） |
+| `docs/1.3-v4l2-notes.md` | 学习笔记（环境探测 / 原理 / 实战 / 数据解读 / review） |
+
+### 进度
+
+| 小节 | 状态 |
+|------|------|
+| 1.0 环境探测 | ✅ |
+| 1.1 GPIO 与 LED | ✅ 结课 |
+| 1.2 字符设备驱动 | ✅ 结课（4 次） |
+| **1.3 摄像头 V4L2** | 🟡 **第 1 次完成**（抓帧存 JPEG ✅） |
+| 1.4 串口与协议 | ⬜ |
+| 1.5 应用工程化 | ⬜ |
+
+### ⏭️ 下次起点：1.3 第 2 次
+
+1. ⬜ **运行时枚举设备节点**（K-016）：遍历 `/dev/video*`，用 `QUERYCAP` 找 `uvcvideo` + `V4L2_CAP_VIDEO_CAPTURE`，替掉硬编码的 `/dev/video10`
+2. ⬜ **抓多帧 / 存图序列**：体会"借还"循环，**实测真实 FPS**（地图里写的 30.23fps 是调研数据，**未实测**）
+3. ⬜ **buffer 快速周转改造**：`DQBUF → memcpy → QBUF（立刻还）→ 慢慢处理`
+4. ⬜ （可选）YUYV 对比实验：实测带宽/CPU 差异，验证 §带宽测算
+
+按五步法走：讲原理 → 定目标 → 给思路 → **你动手** → 我 review
+
+### 遗留
+
+- ⬜ `capture` 可执行文件需加 `.gitignore` 规则
+- ⬜ `Makefile`（app 目录还没有，1.5 会补）
+- ⬜ 排针 UART 电压未量（**1.4 串口接线前必做**）
+- ⬜ 舵机/云台采购（SG90 ×2、二轴支架、独立 5V 电源，约 50 元）
+- ⬜ `/dev/edge_ai0` 的 udev 规则（可选）
+
+**经验库累计**：30 条【实测】+ 15 条【通用】
