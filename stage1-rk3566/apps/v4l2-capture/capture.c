@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <stdlib.h>
@@ -6,21 +7,103 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <dirent.h>
 #include <linux/videodev2.h>
+#include <time.h>
 
-#define DEV_NAME "/dev/video10"
 #define OUT_FILE "frame1.jpg"
 #define BUFFER_COUNT 4
+#define WARMUP_FRAMES   5   /* 预热帧数，不计入FPS*/
 
 struct buffer {
     void *start;        /* mmap 返回地址 */
     size_t length;      /* buffer 容量*/
 };
 
-int main(void)
+/* ------------- 及时辅助---------------*/
+static double now_sec(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* 自动查找USB摄像头采集节点*/
+static int find_capture_device(char *dev_path, size_t path_len)
+{
+    DIR *dir;
+    struct dirent *entry;
+    char full_path[300];
+    int fd = -1;
+
+    dir = opendir("/dev");
+    if (!dir) {
+        perror("opendir /dev");
+        return -1;
+    }
+
+    while ((entry = readdir(dir)) != NULL){
+        /* 只关心 video* 节点*/
+        if (strncmp(entry->d_name, "video", 5) != 0)
+            continue;
+        
+        snprintf(full_path, sizeof(full_path), "/dev/%s", entry->d_name);
+
+        fd = open(full_path, O_RDWR);
+        if(fd < 0){
+            if (errno == EACCES || errno == EPERM) {
+                /* 没权限访问，跳过 */
+                fprintf(stderr, "权限不足，无法打开 %s: %s\n", full_path, strerror(errno));
+            } 
+            /* 其他错误（如设备不存在）忽略，继续找下一个*/
+            continue;
+        }
+
+        struct v4l2_capability cap;
+        if(ioctl(fd, VIDIOC_QUERYCAP, &cap) < 0){
+            close(fd);
+            fd = -1;
+            continue;
+        }
+
+        unsigned int caps = cap.device_caps ? cap.device_caps : cap.capabilities;
+
+        /* 必须是视频采集设备且支持 streaming I/O*/
+        if(!(caps & V4L2_CAP_VIDEO_CAPTURE) || !(caps & V4L2_CAP_STREAMING)){
+            close(fd);
+            fd = -1;
+            continue;
+        }
+
+        /* 只认uvcvideo 驱动，避免误选 RKISP 等平台节点*/
+        if(strcmp((const char *)cap.driver, "uvcvideo") != 0){
+            close(fd);
+            fd = -1;
+            continue;
+        }
+
+        /* 总线信息应包含 “usb”, 进一步确认是USB摄像头*/
+        if(strstr((char *)cap.bus_info, "usb") == NULL){
+            close(fd);
+            fd = -1;
+            continue;
+        }
+
+        /* 找到符合条件的节点 */
+        snprintf(dev_path, path_len, "%.*s", (int)(path_len - 1), full_path);
+        closedir(dir);
+        return fd;   /* 直接返回已打开的 fd */
+    }
+
+    closedir(dir);
+    return -1;
+
+}
+
+int main(int argc, char **argv)
 {
     int fd = -1;
-    struct v4l2_capability cap;
+    char dev_path[300] = {0};
     struct v4l2_format fmt;
     struct v4l2_requestbuffers req;
     struct v4l2_buffer buf;
@@ -29,22 +112,41 @@ int main(void)
     FILE *fp = NULL;
     int i;
     int ret = -1;
+    int streamed = 0;   /* ← 新增：是否已经 STREAMON */
 
-    /*============== 1. Open 设备 ==============*/
-    fd = open(DEV_NAME, O_RDWR);
+    /* ---------------- 解析命令行参数-------------------------*/
+    int total_frames = 30;
+    if (argc >= 2){
+        total_frames = atoi(argv[1]);
+        if(total_frames <= 0){
+            fprintf(stderr, "参数错误: total_frames 必须大于0\n");
+            return 1;
+        }
+    }
+    printf("采集总帧数: %d\n", total_frames);
+    /*================= 0. 查找USB摄像头采集节点 ==============*/
+    fd = find_capture_device(dev_path, sizeof(dev_path));
     if (fd < 0) {
-        perror("open" DEV_NAME);
+        fprintf(stderr, "未找到符合条件的USB摄像头采集节点\n");
         return 1;
     }
-    printf("[1] open %s success, fd = %d\n", DEV_NAME, fd);
+    printf("[0] 找到采集设备: %s, fd=%d\n", dev_path, fd);
 
-    /*============== 2. VIDIOC_QUERYCAP: 查询设备能力，确认它是视频采集设备，且支持 streaming I/O ==============*/
-    memset(&cap, 0, sizeof(cap));
-    if (ioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) {
-        perror("VIDIOC_QUERYCAP");
-        goto cleanup;
-    }
-    printf("[2] QUERYCAP 成功: driver=%s, card=%s\n", cap.driver, cap.card);
+    // /*============== 1. Open 设备 ==============*/
+    // fd = open(DEV_NAME, O_RDWR);
+    // if (fd < 0) {
+    //     perror("open" DEV_NAME);
+    //     return 1;
+    // }
+    // printf("[1] open %s success, fd = %d\n", DEV_NAME, fd);
+
+    // /*============== 2. VIDIOC_QUERYCAP: 查询设备能力，确认它是视频采集设备，且支持 streaming I/O ==============*/
+    // memset(&cap, 0, sizeof(cap));
+    // if (ioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) {
+    //     perror("VIDIOC_QUERYCAP");
+    //     goto cleanup;
+    // }
+    // printf("[2] QUERYCAP 成功: driver=%s, card=%s\n", cap.driver, cap.card);
 
     /*============== 3. VIDIOC_S_FMT: 请求MJPPG 640X480 注：这只是请求，驱动可以给你别的格式 ==============*/
     memset(&fmt, 0, sizeof(fmt));
@@ -150,54 +252,93 @@ int main(void)
         goto cleanup;
     }
     printf("[8] STREAMON: 开始采集\n");
+    streamed = 1;
 
-    /*====================== 9. VIDIOC_DQBUF: 取出一帧（会阻塞直到有数据） ==============*/
-    memset(&buf, 0, sizeof(buf));
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
+    /*===================== 丢弃前 WARMUP_FRAMES 帧，等待自动曝光稳定===============*/
+    for(i = 0; i < WARMUP_FRAMES; i++){
+        memset(&buf, 0, sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
 
-    if (ioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
-        perror("VIDIOC_DQBUF");
-        goto cleanup;
+        if (ioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
+            perror("VIDIOC_DQBUF (warmup)");
+            goto streamoff;  /* 出错直接跳到停止采集 */
+        }
+        if(ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+            perror("VIDIOC_QBUF (warmup)");
+            goto streamoff;
+        }
     }
-    printf("[9] DQBUF: 取出一帧成功, index=%u, bytesused=%u\n", 
-        buf.index, buf.bytesused);
-    
-    /*====================== 10. 把数据写进 frame.jpg ==============*/
-    fp = fopen(OUT_FILE, "wb");
-    if (!fp) {
-        perror("fopen " OUT_FILE);
-        goto requeue;
-    }
-    size_t written = fwrite(buffers[buf.index].start, 1, buf.bytesused, fp);
-    fclose(fp);
-    fp = NULL;
-
-    if(written != buf.bytesused) {
-        fprintf(stderr, "警告: 只写入 %zu / %u 字节\n", written, buf.bytesused);
-    }else{
-        printf("[10] 写入 %s (%u字节)\n", OUT_FILE, buf.bytesused);
-    }
+    printf("预热 %d 帧完成，开始正式计时\n", WARMUP_FRAMES);
 
 
-    /*=================== 11. VIDIOC_QBUF：把 buffer 还回去===========*/
-requeue:
-    if(ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
-        perror("VIDIOC_QBUF (requeue)");
-        goto streamoff;
+    /*====================== 9. VIDIOC_DQBUF: 连续抓帧 + 计时 ==============*/
+    double t_start = now_sec();
+    int frames_ok = 0;
+    long long total_bytes = 0;
+
+    for(i = 0; i < total_frames; i++){
+        memset(&buf, 0, sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+
+        if (ioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
+            perror("VIDIOC_DQBUF");
+            goto streamoff;  /* 出错直接跳到停止采集 */
+        }
+        frames_ok++;
+        total_bytes += buf.bytesused;
+
+        /* 只保存第一帧，避免磁盘IO拖慢 FPS*/
+        if(i == 0){
+            FILE *fp = fopen(OUT_FILE, "wb");
+            if (fp) {
+                fwrite(buffers[buf.index].start, 1, buf.bytesused, fp);
+                fclose(fp);
+                printf("保存第一帧到 %s (%u字节)\n", OUT_FILE, buf.bytesused);
+            } else {
+                perror("fopen " OUT_FILE);
+            }
+        }
+        
+        /* 打印每一帧的进度*/
+        if((i + 1) % 10 == 0 || i == total_frames - 1){
+           printf(" 已抓 %d %d 帧，本帧 %u 字节\n", i + 1, total_frames, buf.bytesused);
+        }
+
+        if(ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+            perror("VIDIOC_QBUF");
+            goto streamoff;
+        }
     }
-    printf("[11] buffer[%d] 还回队列成功\n", buf.index);
+   
+    double t_end = now_sec();
+   
+    /* ==================== 统计结果 ========================== */
+    double elapsed = t_end - t_start;
+    printf("\n========== 结果 ==========\n");
+    printf("成功抓取帧数 : %d\n", frames_ok);
+    printf("总耗时       : %.3f 秒\n", elapsed);
+    if (elapsed > 0) {
+        printf("平均 FPS     : %.2f\n", frames_ok / elapsed);
+    }
+    if (frames_ok > 0) {
+        printf("平均每帧大小 : %.1f 字节\n",
+               (double)total_bytes / frames_ok);
+    }
+    printf("==========================\n");
+
+    ret = 0;
 
     /*=================== 12. VIDIOC_STREAMOFF: 停止采集===========*/
 streamoff:
-    type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    if (ioctl(fd, VIDIOC_STREAMOFF, &type) < 0)
-    {
-        perror("VIDIOC_STREAMOFF");
-    }else{
-        printf("[12] STREAMOFF: 停止采集\n");   
+    if (streamed) {                     /* ← 用 streamed 判断是否执行 STREAMOFF */
+        type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (ioctl(fd, VIDIOC_STREAMOFF, &type) < 0)
+            perror("VIDIOC_STREAMOFF");
+        else
+            printf("[12] STREAMOFF: 停止采集\n");
     }
-    ret = 0;
 
     /*================= 13. munmap X N, close, 释放内存================*/
 
