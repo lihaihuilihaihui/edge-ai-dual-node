@@ -168,7 +168,11 @@ gpiochip0 [gpio0] 32 lines ... gpiochip4 [gpio4] 32 lines   （5 个 bank，各 
 
 **分 2 次**：
 1. ✅ 环境探测 + `v4l2-ctl` 打通链路 + **自写 `capture.c` 抓一帧存 JPEG** —— 2026-10-03
-2. ⬜ 运行时枚举设备节点（K-016）+ 抓多帧/存图序列 + YUYV 对比实验
+2. 🟡 运行时枚举设备节点 ✅ + 连续采集/计时 ✅ + **⚠️ FPS 异常待查** ⬜ —— 2026-10-05
+
+> ⏭️ **下次开工第一件事**：查清 FPS 只有 16.58（期望 30.23）的原因。
+> 最强假设：**光线暗 → 自动曝光拉长曝光时间 → 帧率被拖慢**（16.58fps 几乎精确对应 60ms 曝光）。
+> 四条验证命令见 `docs/1.3b-continuous-capture.md` §2.3。
 
 **实测数据（2026-10-03）**：
 - 设备：`USB Camera`；采集节点 **`/dev/video10`**（`video11` 是 metadata 节点）
@@ -181,7 +185,7 @@ gpiochip0 [gpio0] 32 lines ... gpiochip4 [gpio4] 32 lines   （5 个 bank，各 
 
 **验收**：✅ 存下 640×480 JPEG，能在电脑上正常显示画面
 
-**笔记**：`docs/1.3-v4l2-notes.md`
+**笔记**：`docs/1.3-v4l2-notes.md`（原理/环境探测）、`docs/1.3b-continuous-capture.md`（连续采集/FPS 异常排查）
 
 **对应 FR**：FR-20
 
@@ -314,25 +318,35 @@ graph TB
 | 1.0 环境探测收尾 | ✅ **完成** | 2026-09-20 |
 | 1.1 GPIO 与 LED | ✅ **结课**（笔记：`docs/1.1-gpio-notes.md`） | 2026-09-21 |
 | 1.2 字符设备驱动 | ✅ **结课**（4 次全部完成；笔记：`docs/1.2-driver-notes.md`） | 2026-09-29 |
-| 1.3 摄像头 V4L2 | 🟡 **进行中**（第 1 次 ✅：抓帧存 JPEG；笔记：`docs/1.3-v4l2-notes.md`） | 2026-10-03 |
+| 1.3 摄像头 V4L2 | 🟡 **进行中**（枚举 ✅ / 连续采集 ✅ / **FPS 待查** ⬜） | 2026-10-05 |
 | 1.4 串口与协议 | ⬜ 未开始 | |
 | 1.5 应用工程化 | ⬜ 未开始 | |
 
-### ⏭️ 下次起点：1.3 第 2 次 —— 设备枚举 + 抓多帧
+### ⏭️ 下次起点：1.3 第 2 次续 —— ⚠️ 先查 FPS 异常
 
 **已完成**：
-- ✅ 环境探测（识别 `video10` = 采集节点、`video11` = metadata；MJPG 可用）
-- ✅ `v4l2-ctl` 打通链路
-- ✅ **自写 `capture.c`：抓一帧存 JPEG，画面正常**
+- ✅ 环境探测（`video10` = 采集节点、`video11` = metadata；MJPG 可用）
+- ✅ `v4l2-ctl` 打通链路；自写 `capture.c` 抓一帧存 JPEG
+- ✅ **运行时枚举设备节点**（`uvcvideo` + `device_caps & VIDEO_CAPTURE` + `STREAMING`）
+- ✅ 连续采集 N 帧 + `CLOCK_MONOTONIC` 计时 + 预热帧丢弃
 
-**下次要做的**：
-1. ⬜ **运行时枚举设备节点**（K-016 要求）：遍历 `/dev/video*`，用 `QUERYCAP` 找 `uvcvideo` + `V4L2_CAP_VIDEO_CAPTURE`，替掉硬编码的 `#define DEV_NAME "/dev/video10"`
-2. ⬜ **抓多帧 / 存图序列**：体会 QBUF/DQBUF “借还”循环；实测真实 FPS
-3. ⬜ **buffer 快速周转改造**：`DQBUF → memcpy → QBUF（立刻还）→ 慢慢处理`
-4. ⬜ （可选）**YUYV 对比实验**：同分辨率切 YUYV，实测带宽/CPU 差异
+**⚠️ 未解决**：实测 **16.58 fps**（期望 30.23）。代码逻辑已逐项审过，**没问题**。
 
-> 📝 **帧率已有实测**：`references/hardware.md` §2.5 记录 MJPG 640×480 稳态 **30.23 fps**（300 帧长测，2026-09-10）；短测偏低是 UVC 预热期正常现象（K-020）。
-> 第 2 次抓多帧时**复测一次**，看与当时是否一致。
+**下次第一件事（5 分钟定性）**：
+```bash
+v4l2-ctl -d /dev/video10 --get-ctrl=auto_exposure,exposure_time_absolute
+v4l2-ctl -d /dev/video10 --set-ctrl=auto_exposure=1
+v4l2-ctl -d /dev/video10 --set-ctrl=exposure_time_absolute=100
+v4l2-ctl -d /dev/video10 --stream-mmap --stream-count=300
+./capture 100
+```
+> 判读：曝光≈600（60ms）→ **假设成立**，是光照问题不是代码问题；曝光≈300 → 假设不成立，改查 printf 开销等次要嫌疑。
+> 详见 `docs/1.3b-continuous-capture.md` §2.3。
+
+**之后**：
+1. ⬜ **buffer 快速周转改造**：`DQBUF → memcpy → QBUF（立刻还）→ 慢慢处理`
+2. ⬜ 拆函数（`main()` 太长，`goto cleanup` 在加循环后难维护）
+3. ⬜ （可选）**YUYV 对比实验**：实测带宽/CPU 差异
 
 按五步法走：1. 我讲原理 → 2. 我定目标 → 3. 我给思路 → 4. **你动手** → 5. 我 review
 
