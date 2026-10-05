@@ -10,6 +10,7 @@
 #include <dirent.h>
 #include <linux/videodev2.h>
 #include <time.h>
+#include <stdint.h>
 
 #define OUT_FILE "frame1.jpg"
 #define BUFFER_COUNT 4
@@ -20,12 +21,18 @@ struct buffer {
     size_t length;      /* buffer 容量*/
 };
 
-/* ------------- 及时辅助---------------*/
+/* ------------- 计时辅助---------------*/
 static double now_sec(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/*--------------- timeval  微秒整数 ----------*/
+static uint64_t ts_to_us(const struct timeval *tv)
+{
+    return (uint64_t)tv->tv_sec * 1000000ULL + (uint64_t)tv->tv_usec;
 }
 
 /* 自动查找USB摄像头采集节点*/
@@ -114,16 +121,29 @@ int main(int argc, char **argv)
     int ret = -1;
     int streamed = 0;   /* ← 新增：是否已经 STREAMON */
 
-    /* ---------------- 解析命令行参数-------------------------*/
+    /* -------------- 命令行参数 --------------- */
     int total_frames = 30;
+    int delay_us = 0;
+    int fast_mode = 0;
+    /* ---------------- 解析命令行参数-------------------------*/
     if (argc >= 2){
         total_frames = atoi(argv[1]);
         if(total_frames <= 0){
-            fprintf(stderr, "参数错误: total_frames 必须大于0\n");
+            fprintf(stderr, "用法: %s <帧数> [延时us] [fast]\n", argv[0]);
             return 1;
         }
     }
-    printf("采集总帧数: %d\n", total_frames);
+    if (argc >= 3) {
+        delay_us = atoi(argv[2]);
+        if (delay_us < 0) delay_us = 0;
+    }
+    if (argc >= 4 && strcmp(argv[3], "fast") == 0)
+        fast_mode = 1;
+
+    printf("采集总帧数 : %d\n", total_frames);
+    printf("延时       : %d us\n", delay_us);
+    printf("模式       : %s\n", fast_mode ? "fast(先还再延时)" : "slow(持有期间延时)");
+
     /*================= 0. 查找USB摄像头采集节点 ==============*/
     fd = find_capture_device(dev_path, sizeof(dev_path));
     if (fd < 0) {
@@ -131,22 +151,6 @@ int main(int argc, char **argv)
         return 1;
     }
     printf("[0] 找到采集设备: %s, fd=%d\n", dev_path, fd);
-
-    // /*============== 1. Open 设备 ==============*/
-    // fd = open(DEV_NAME, O_RDWR);
-    // if (fd < 0) {
-    //     perror("open" DEV_NAME);
-    //     return 1;
-    // }
-    // printf("[1] open %s success, fd = %d\n", DEV_NAME, fd);
-
-    // /*============== 2. VIDIOC_QUERYCAP: 查询设备能力，确认它是视频采集设备，且支持 streaming I/O ==============*/
-    // memset(&cap, 0, sizeof(cap));
-    // if (ioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) {
-    //     perror("VIDIOC_QUERYCAP");
-    //     goto cleanup;
-    // }
-    // printf("[2] QUERYCAP 成功: driver=%s, card=%s\n", cap.driver, cap.card);
 
     /*============== 3. VIDIOC_S_FMT: 请求MJPPG 640X480 注：这只是请求，驱动可以给你别的格式 ==============*/
     memset(&fmt, 0, sizeof(fmt));
@@ -254,6 +258,16 @@ int main(int argc, char **argv)
     printf("[8] STREAMON: 开始采集\n");
     streamed = 1;
 
+    /* -------------fast 模式：准备自己的缓冲区 -----------------*/
+    unsigned char *my_buf = NULL;
+    if(fast_mode){
+        my_buf = malloc(fmt.fmt.pix.sizeimage);
+        if(!my_buf){
+            perror("malloc mybuf");
+            goto streamoff;
+        }
+    }
+
     /*===================== 丢弃前 WARMUP_FRAMES 帧，等待自动曝光稳定===============*/
     for(i = 0; i < WARMUP_FRAMES; i++){
         memset(&buf, 0, sizeof(buf));
@@ -277,6 +291,10 @@ int main(int argc, char **argv)
     int frames_ok = 0;
     long long total_bytes = 0;
 
+    uint32_t first_seq = 0, last_seq = 0;
+    uint64_t first_ts  = 0, last_ts  = 0;
+    int      have_first = 0;
+
     for(i = 0; i < total_frames; i++){
         memset(&buf, 0, sizeof(buf));
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -287,7 +305,27 @@ int main(int argc, char **argv)
             goto streamoff;  /* 出错直接跳到停止采集 */
         }
         frames_ok++;
-        total_bytes += buf.bytesused;
+        unsigned int frame_bytes = buf.bytesused;
+        uint64_t     ts          = ts_to_us(&buf.timestamp);
+        uint32_t     seq         = buf.sequence;
+
+        total_bytes += frame_bytes;
+
+        /* 记录首帧 */
+        if (!have_first) {
+            first_seq  = seq;
+            first_ts   = ts;
+            have_first = 1;
+        }
+        /* 每帧都更新末帧 */
+        last_seq = seq;
+        last_ts  = ts;
+
+        printf("seq=%u ts=%ld.%06ld  bytes=%u\n",
+               seq,
+               (long)buf.timestamp.tv_sec,
+               (long)buf.timestamp.tv_usec,
+               frame_bytes);
 
         /* 只保存第一帧，避免磁盘IO拖慢 FPS*/
         if(i == 0){
@@ -300,31 +338,60 @@ int main(int argc, char **argv)
                 perror("fopen " OUT_FILE);
             }
         }
-        
-        /* 打印每一帧的进度*/
-        if((i + 1) % 10 == 0 || i == total_frames - 1){
-           printf(" 已抓 %d %d 帧，本帧 %u 字节\n", i + 1, total_frames, buf.bytesused);
+
+        /* -----分叉：slow VS fast ------------*/
+        if(fast_mode){
+            /* 先拷贝出来，立刻还buffer，再延时*/
+            memcpy(my_buf, buffers[buf.index].start, buf.bytesused);
+            if(ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+                perror("VIDIOC_QBUF");
+                goto streamoff;
+            }
+            if(delay_us > 0)
+                usleep(delay_us);
+        }else{
+            /* 持有buffer 期间延时*/
+            if(delay_us > 0)
+                usleep(delay_us);
+            if(ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+                perror("VIDIOC_QBUF");
+                goto streamoff;
+            }
         }
 
-        if(ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
-            perror("VIDIOC_QBUF");
-            goto streamoff;
+        /* 打印每一帧的进度*/
+        if((i + 1) % 10 == 0 || i == total_frames - 1){
+           printf(" 已抓 %d %d 帧，本帧 %u 字节\n", i + 1, total_frames, frame_bytes);
         }
     }
    
     double t_end = now_sec();
-   
-    /* ==================== 统计结果 ========================== */
     double elapsed = t_end - t_start;
-    printf("\n========== 结果 ==========\n");
+
+    /* ================= 统计结果 ================= */
+   printf("\n========== 结果 ==========\n");
     printf("成功抓取帧数 : %d\n", frames_ok);
     printf("总耗时       : %.3f 秒\n", elapsed);
-    if (elapsed > 0) {
-        printf("平均 FPS     : %.2f\n", frames_ok / elapsed);
-    }
-    if (frames_ok > 0) {
-        printf("平均每帧大小 : %.1f 字节\n",
-               (double)total_bytes / frames_ok);
+
+    double prog_fps = (elapsed > 0) ? frames_ok / elapsed : 0;
+    printf("程序 FPS     : %.2f\n", prog_fps);
+    printf("平均每帧大小 : %.1f 字节\n",
+           frames_ok > 0 ? (double)total_bytes / frames_ok : 0);
+
+    /* ⭐ 用 sequence 计算真实帧率 */
+    if (have_first && last_seq > first_seq) {
+        double span_s    = (double)(last_ts - first_ts) / 1e6;
+        double real_fps  = (double)(last_seq - first_seq) / span_s;
+        int    cam_frames = (int)(last_seq - first_seq + 1);
+        double drop_rate = 1.0 - (double)frames_ok / cam_frames;
+
+        printf("时间跨度     : %.3f 秒\n", span_s);
+        printf("seq 跨度     : %u\n", last_seq - first_seq);
+        printf("摄像头出帧数 : %d\n", cam_frames);
+        printf("真实帧率     : %.2f fps\n", real_fps);
+        printf("丢帧率       : %.1f%%\n", drop_rate * 100.0);
+    } else {
+        printf("(没有足够的 sequence 样本)\n");
     }
     printf("==========================\n");
 
