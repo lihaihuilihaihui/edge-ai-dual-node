@@ -229,6 +229,44 @@ v4l2-ctl -d /dev/video10 \
 ```bash
 sudo usermod -aG dialout lihaihui   # 之后需重新登录
 ```
+> ✅ 2026-09 已加入 `dialout`，实测**普通用户可直接访问 `/dev/ttyS3`，不需要 `sudo`**。
+
+**⭐ 内部回环可用（2026-10-08 实测）—— 不需要外部导线就能做自环测试**
+
+| 项 | 结果 |
+|----|------|
+| 芯片类型 | `16550A`（8250 兼容，见 `/proc/tty/driver/serial`） |
+| 内部回环 | ✅ **可用** —— `ioctl(fd, TIOCMBIS, &TIOCM_LOOP)` 调用成功 |
+| 实测回环 | 发出 `"HELLO"`（5 字节）→ 读回 `"HELLO"`，**内容完全一致** |
+| **意义** | **1.4 的"1000 帧 0 误码"验收可在这块板子上直接完成**，不需要杜邦线 |
+
+**原理**：8250 系列 UART 的 MCR 寄存器有 `LOOP` 位，置位后**芯片内部把 TX 直接接回 RX**。
+`TIOCM_LOOP` **不在** glibc 头文件里（它是内核扩展宏，定义在 `<asm-generic/termios.h>`），
+需要手动 `#define TIOCM_LOOP 0x8000` → 详见 **K-050**。
+
+**`/proc/tty/driver/serial` 实测（2026-10-08）**
+
+```
+1: uart:16550A mmio:0xFE650000 irq:35 tx:52304 rx:2447 RTS|CTS|DTR   ← Bluetooth 在用
+3: uart:16550A mmio:0xFE670000 irq:36 tx:0     rx:0     CTS          ← 干净，从未使用
+```
+
+> ⭐ `tx:0 rx:0` 证明 ttyS3 **自开机以来一个字节都没收发过** —— 排针 UART 是独占可用的。
+> （对比 ttyS1 的 52304/2447，那是 Bluetooth 的流量。）
+
+**开机默认 termios 配置（2026-10-08 实测）**
+
+```
+speed 9600 baud
+cs8 -cstopb -parenb cread clocal -crtscts          ← 硬件参数默认就是对的 ✅
+-igncr icrnl ixon ...                              ← ⚠️ 输入转换/软件流控开着
+opost ... onlcr ...                                ← ⚠️ 输出转换开着
+isig icanon echo ...                               ← ⚠️ 终端行为全开着
+```
+
+> ⚠️ **做二进制协议时这 7 个开关必须全部关掉**（`cfmakeraw()` 一行搞定），
+> 否则会出现"帧内容被篡改""帧长度变了""程序被 Ctrl+C 杀掉""通信卡死"等诡异现象。
+> 原理与案例见 `stage1-rk3566/docs/1.4-serial-notes.md` §二。
 
 **console 不会占用户串口**
 

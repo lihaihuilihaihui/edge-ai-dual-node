@@ -949,6 +949,79 @@
 
 ---
 
+### K-050 【实测】`TIOCM_LOOP` 不在 glibc 头文件里 —— 内核扩展宏需要手动补
+- **日期**：2026-10-09
+- **现象**：写串口内部回环测试，编译报：
+  ```
+  error: 'TIOCM_LOOP' undeclared (first use in this function); did you mean 'TIOCM_LE'?
+  ```
+  但 `TIOCM_LE` 是有的
+- **根因**：`TIOCM_*` 这一族宏分两类：
+
+  | 类别 | 例子 | 定义在哪 | glibc 的 `<sys/ioctl.h>` 会带进来吗 |
+  |------|------|---------|--------------------------------|
+  | **POSIX 标准的** | `TIOCM_LE`、`TIOCM_DTR`、`TIOCM_CTS`…（共 11 个） | glibc 的 `<bits/ioctl-types.h>` | ✅ |
+  | **内核扩展** | **`TIOCM_LOOP`**、`TIOCM_OUT1`、`TIOCM_OUT2` | 内核 UAPI 的 `<asm-generic/termios.h>` | ❌ |
+
+  编译器的 `did you mean 'TIOCM_LE'?` 就是提示“你想要的这族里我只认识前 11 个”
+- **解法**：手动补值 + `#ifndef` 保护
+  ```c
+  #ifndef TIOCM_LOOP
+  #define TIOCM_LOOP      0x8000   /* 值来自 <asm-generic/termios.h>，所有 Linux 架构通用 */
+  #endif
+  ```
+- **为什么不直接 `#include <asm-generic/termios.h>`**：那个头会重复定义 `struct termios`、`NCCS` 等，与 glibc 的 `<termios.h>` 冲突
+- **验证方法**：`grep -rn "define TIOCM_LOOP" /usr/include/`
+- **关联**：`stage1-rk3566/docs/1.4-serial-notes.md` §六
+
+---
+
+### K-051 【实测】`speed_t` 是“编码值”，不是波特率
+- **日期**：2026-10-09
+- **现象**：打印 `cfgetispeed()` / `cfgetospeed()` 的返回值，得到 **13** 和 **4098**，而不是 9600 / 115200
+- **根因**：`speed_t` 是内核的**编码值**（历史上为了兼容硬件寄存器而设的枚举）：
+  ```
+  B9600   在 <asm-generic/termbits.h> 里是  0000015（八进制） = 13（十进制）
+  B115200 在 <asm-generic/termbits.h> 里是 0010002（八进制） = 4098（十进制）
+  ```
+  ⚠️ **这纠正了一个常见误解**：“`B115200` 的值恰好等于 115200” —— **在 aarch64/asm-generic 上根本不成立**
+- **解法**：写一张转换表（见 `serial_probe.c` 里的 `speed_to_baud()`）
+- **旁证**：`stty` 能显示 `speed 9600 baud`，正是因为**它内置了这张表**
+- **教训**：**不要假设“宏的值就是它的含义”** —— 这类“语义与数值分离”的 API 在嵌入式里不少（V4L2 的 fourcc、ioctl 命令号都是）
+- **关联**：`stage1-rk3566/docs/1.4-serial-notes.md` §六；K-043（ioctl 命令号也是编码值）
+
+---
+
+### K-052 【实测】TTY 配置是“设备状态”，跨进程持久 —— 用完要恢复
+- **日期**：2026-10-08
+- **现象**：同一个 `serial_probe` 程序，**第一次跑**“配置前”显示默认值（一堆 `1` + 9600）；**第二次跑**“配置前”已经变成全 `0` + 115200
+- **根因**：`tcsetattr()` 改的是**内核里这个 tty 对象的状态**（`tty_struct`），**不是进程状态**。
+  `close(fd)` 只是“我不用了”，**不会恢复配置**
+  ```
+  你的进程                     内核
+  ┌────────────┐         ┌─────────────┐
+  │ serial_probe │─tcsetattr─►│ ttyS3 的状态 │  ← 改的是这里
+  └────────────┘         └─────────────┘
+        │ 退出
+        ▼
+     进程没了，但 ttyS3 的状态【还在】
+  ```
+- **⚠️ 实际后果**：程序被 `kill -9` 或崩溃时，串口就**永远留在裸模式**。之后用 `screen`/`minicom` 连它调试，会觉得“行为很怪”（没回显、Ctrl+C 不工作）
+- **解法**：进程序时存一份原始配置，退出前还回去
+  ```c
+  struct termios orig_tio;
+  tcgetattr(fd, &tio);
+  orig_tio = tio;              /* 保存 */
+  /* ……干活…… */
+  tcsetattr(fd, TCSANOW, &orig_tio);   /* 退出前恢复 */
+  ```
+- **验证**：手工 `stty sane` 恢复默认 → 跑程序（读到默认、改、用完恢复）→ **再跑，又读到默认** ✅
+- **残留风险**：上面只覆盖“正常退出”。**被 `kill -9` 时仍需 `stty sane` 手动恢复**
+- **手动恢复命令**：`stty -F /dev/ttyS3 sane`（注意：`sane` 给的是一组“现代合理默认”，和开机默认不完全一样，比如不开 `ixon`）
+- **关联**：`stage1-rk3566/docs/1.4-serial-notes.md` §3.4
+
+---
+
 ## 七、待填充区域
 
 > 以下是本项目**尚未遇到但很可能遇到**的领域，踩坑后追加。
@@ -968,7 +1041,7 @@
 
 | 来源 | 条数 |
 |------|------|
-| 【实测】（本项目亲历） | 34 |
+| 【实测】（本项目亲历） | 37 |
 | 【通用】（已知陷阱，未亲历） | 15 |
 
 > 💡 **启发式观察**：当一个坑被踩过两次，说明它不是"坑"而是"知识盲区"，应该把根因写进 `SKILL.md` 或阶段学习笔记，而不只是记在这里。
