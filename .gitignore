@@ -67,8 +67,20 @@ stage0-toolchain/practice/**/*.d
 stage1-rk3566/drivers/**/test_*
 !stage1-rk3566/drivers/**/test_*.c
 
-# 应用目录下的编译产物（源码要提交，产物不提交）
-stage1-rk3566/apps/**/capture
+# 应用目录下：只提交源码，其余（编译产物等）不提交
+#
+# 为什么用"白名单"而不是逐个列出产物名？
+#   因为每加一个新程序就要改一次规则，容易忘。白名单一次配好，以后不用管。
+#
+# 语法说明：
+#   apps/*/*        匹配 apps/子目录/文件 —— 注意它【不匹配目录本身】，
+#                   所以 apps/xxx/ 不会被忽略，下面的 ! 排除规则才能生效
+#                   （gitignore 的坑：父目录被忽略时，里面的 ! 规则不生效）
+stage1-rk3566/apps/*/*
+!stage1-rk3566/apps/*/*.c
+!stage1-rk3566/apps/*/*.cpp
+!stage1-rk3566/apps/*/*.h
+!stage1-rk3566/apps/*/*.md
 
 # 系统备份镜像
 *.img.gz
