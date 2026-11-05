@@ -114,10 +114,16 @@ extern "C" {
  *
  * 返回：ProtoResult
  * ============================================================ */
-ProtoResult proto_encode(const struct ProtoFrame *frame,
-                         uint8_t                 *out_buf,
-                         size_t                   out_cap,
-                         size_t                  *out_len);
+
+/* ⚠️ 这里必须写 `enum ProtoResult`，不能只写 `ProtoResult`：
+ *      C 里 enum 的类型名是 `enum Xxx`，裸的 `Xxx` 不存在；
+ *      只有 C++ 才允许省略 enum 关键字。
+ *    本头文件被 .c 文件包含（serial_probe.c / serial_loopback_test.c /
+ *    将来的 ESP32 代码），所以必须写成 C 兼容形式。 */
+enum ProtoResult proto_encode(const struct ProtoFrame *frame,
+                              uint8_t                 *out_buf,
+                              size_t                   out_cap,
+                              size_t                  *out_len);
 
 /* ============================================================
  * proto_dump —— 把一段字节按 "AA 55 06 02 05 ..." 格式打印出来
